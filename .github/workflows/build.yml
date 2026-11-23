@@ -31,6 +31,7 @@ jobs:
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
+            -DLUA_USE_IOS \
             -O2 -c third_party/lua/*.c
           mv *.o build/
 
