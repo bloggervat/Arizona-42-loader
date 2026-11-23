@@ -1,0 +1,61 @@
+name: Build iOS LuaLoader Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Lua 5.4.7 source
+        run: |
+          curl -L -R -O https://www.lua.org/ftp/lua-5.4.7.tar.gz
+          tar zxf lua-5.4.7.tar.gz
+          mkdir -p third_party/lua
+          cp lua-5.4.7/src/*.c third_party/lua/
+          cp lua-5.4.7/src/*.h third_party/lua/
+          rm -f third_party/lua/lua.c third_party/lua/luac.c
+
+      - name: Compile LuaLoader.dylib (arm64)
+        run: |
+          mkdir -p build
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -O2 -c third_party/lua/*.c
+          mv *.o build/
+
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -std=c++17 -fobjc-arc -O2 \
+            -Ithird_party/lua \
+            -c src/loader.mm -o build/loader.o
+
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -dynamiclib \
+            -install_name @executable_path/Frameworks/LuaLoader.dylib \
+            -framework Foundation \
+            -framework UIKit \
+            build/*.o -o build/LuaLoader.dylib
+
+          codesign -f -s - build/LuaLoader.dylib
+
+      - name: Upload LuaLoader.dylib Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LuaLoader-iOS
+          path: build/LuaLoader.dylib
