@@ -85,7 +85,7 @@ void StartLuaEngine() {
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
             if (!g_LoaderWelcomeShown && IsSampReady()) {
-                AddLocalChatMessage("{9B59B6}[42loader] {FFFFFF}42loader loaded. Have fun! By {9B59B6}bloggervat {FFFFFF}t.me/bedrockarzrp", 0xFFFFFFFF);
+                AddLocalChatMessage("{9B59B6}[42loader] {FFFFFF}42loader loaded. Have fun! By {9B59B6}bloggervat.fun {FFFFFF}t.me/bedrockarzrp", 0xFFFFFFFF);
                 g_LoaderWelcomeShown = true;
             }
             
