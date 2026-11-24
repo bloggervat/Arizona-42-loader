@@ -26,7 +26,7 @@ jobs:
         run: |
           mkdir -p build
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          
+
           xcrun --sdk iphoneos clang \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
@@ -47,7 +47,7 @@ jobs:
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
-            -dynamiclib \
+            -dynamiclib -fobjc-arc \
             -install_name @executable_path/Frameworks/LuaLoader.dylib \
             -framework Foundation \
             -framework UIKit \
