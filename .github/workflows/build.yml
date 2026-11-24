@@ -3,8 +3,6 @@ name: Build LuaLoader.dylib (iOS arm64)
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -15,92 +13,69 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download & patch Lua 5.4.7 for iOS
+      - name: Download & patch Lua 5.4.7
         run: |
-          mkdir -p build/lua build/imgui
+          mkdir -p build/lua
           curl -fsSL https://www.lua.org/ftp/lua-5.4.7.tar.gz -o lua-5.4.7.tar.gz
           tar -xzf lua-5.4.7.tar.gz
-          python3 -c '
-          p = "lua-5.4.7/src/loslib.c"
-          s = open(p, "r", encoding="utf-8").read()
-          s = s.replace("int stat = system(cmd);", "int stat = (cmd == NULL) ? 0 : -1;")
-          open(p, "w", encoding="utf-8").write(s)
-          '
+          cp lua-5.4.7/src/*.c lua-5.4.7/src/*.h lua-5.4.7/src/lua.hpp build/lua/
+          rm -f build/lua/lua.c build/lua/luac.c
+          sed -i '' 's/system(cmd)/((cmd) == NULL ? 0 : -1)/g' build/lua/loslib.c
 
       - name: Download Dear ImGui v1.91.6
         run: |
+          mkdir -p build/imgui/backends
           curl -fsSL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.6.tar.gz -o imgui.tar.gz
           tar -xzf imgui.tar.gz
+          cp imgui-1.91.6/*.cpp imgui-1.91.6/*.h build/imgui/
+          cp imgui-1.91.6/backends/imgui_impl_metal.h imgui-1.91.6/backends/imgui_impl_metal.mm build/imgui/backends/
 
       - name: Compile Lua 5.4.7 & Dear ImGui (arm64 iOS)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p build/obj/lua build/obj/imgui
 
-          for f in lua-5.4.7/src/*.c; do
-            base=$(basename "$f")
-            if [ "$base" != "lua.c" ] && [ "$base" != "luac.c" ]; then
-              clang -arch arm64 \
-                -isysroot "$SDK" \
-                -miphoneos-version-min=14.0 \
-                -O2 \
-                -DLUA_USE_IOS \
-                -c "$f" -o "build/lua/${base%.c}.o"
-            fi
+          for f in build/lua/*.c; do
+            name=$(basename "$f" .c)
+            clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+              -O2 -DLUA_USE_IOS -Ibuild/lua -c "$f" -o "build/obj/lua/${name}.o"
           done
 
-          for f in imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp; do
-            clang++ -arch arm64 \
-              -isysroot "$SDK" \
-              -miphoneos-version-min=14.0 \
-              -std=c++17 \
-              -O2 \
-              -Iimgui-1.91.6 \
-              -c "imgui-1.91.6/$f" -o "build/imgui/${f%.cpp}.o"
+          for f in build/imgui/imgui.cpp build/imgui/imgui_draw.cpp build/imgui/imgui_tables.cpp build/imgui/imgui_widgets.cpp; do
+            name=$(basename "$f" .cpp)
+            clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+              -std=c++17 -O2 -Ibuild/imgui -c "$f" -o "build/obj/imgui/${name}.o"
           done
 
-          clang++ -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -std=c++17 \
-            -fobjc-arc \
-            -O2 \
-            -Iimgui-1.91.6 \
-            -Iimgui-1.91.6/backends \
-            -c "imgui-1.91.6/backends/imgui_impl_metal.mm" \
-            -o "build/imgui/imgui_impl_metal.o"
+          clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+            -std=c++17 -fobjc-arc -O2 -Ibuild/imgui -Ibuild/imgui/backends \
+            -c build/imgui/backends/imgui_impl_metal.mm -o build/obj/imgui/imgui_impl_metal.o
 
       - name: Build LuaLoader.dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang++ -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -std=c++17 \
-            -fobjc-arc \
-            -O2 \
-            -dynamiclib \
+          clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+            -dynamiclib -std=c++17 -fobjc-arc -O2 \
             -install_name @executable_path/Frameworks/LuaLoader.dylib \
-            -Ilua-5.4.7/src \
-            -Iimgui-1.91.6 \
-            -Iimgui-1.91.6/backends \
-            build/lua/*.o \
-            build/imgui/*.o \
-            src/*.mm \
-            -o build/LuaLoader.dylib \
+            -Ibuild/lua -Ibuild/imgui -Ibuild/imgui/backends \
+            src/loader.mm build/obj/lua/*.o build/obj/imgui/*.o \
             -framework Foundation \
             -framework UIKit \
-            -framework UserNotifications \
+            -framework CoreGraphics \
             -framework QuartzCore \
             -framework Metal \
-            -framework MetalKit
+            -framework MetalKit \
+            -framework UserNotifications \
+            -o LuaLoader.dylib
 
       - name: Ad-hoc sign & verify dylib
         run: |
-          codesign --force --sign - build/LuaLoader.dylib
-          otool -L build/LuaLoader.dylib
+          codesign --force --sign - --timestamp=none LuaLoader.dylib
+          codesign -dv --verbose=4 LuaLoader.dylib
+          otool -L LuaLoader.dylib
 
       - name: Upload LuaLoader.dylib artifact
         uses: actions/upload-artifact@v4
         with:
           name: LuaLoader-ios-arm64
-          path: build/LuaLoader.dylib
+          path: LuaLoader.dylib
