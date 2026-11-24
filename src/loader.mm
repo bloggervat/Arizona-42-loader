@@ -1,2392 +1,1859 @@
-#import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <UserNotifications/UserNotifications.h>
-#import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
-#import <MetalKit/MetalKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
+#import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
-#import <sys/mman.h>
-#import <pthread.h>
+#import <dlfcn.h>
 
 #include <string>
 #include <vector>
+#include <map>
 #include <unordered_map>
 #include <mutex>
-#include <atomic>
-#include <cmath>
+#include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <cstdio>
+#include <cmath>
 
-#include "lua.hpp"
+extern "C" {
+#include "lua.h"
+#include "lualib.h"
+#include "lauxlib.h"
+}
+
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "imgui_impl_metal.h"
 
 // ============================================================================
-// 1. Встроенный 64-bit Mach-O fishhook для перехвата C/C++ символов в iOS
+// 1. JNI / SAMP / FISHHOOK TYPES
 // ============================================================================
-namespace Fishhook {
 
-struct Rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
+typedef void* JNIEnv;
+typedef void* jobject;
+typedef void* jbyteArray;
+
+typedef void (*Fn_OnInputEnd)(JNIEnv* env, jobject thiz, jbyteArray array);
+typedef void (*Fn_SendCommand)(void* thisPtr, const char* cmd);
+typedef void (*Fn_SendChat)(void* thisPtr, const char* msg);
+typedef void (*Fn_AddChatMessage)(void* thisPtr, uint32_t color, const char* text);
+typedef void (*Fn_ShowDialog)(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b);
+
+static Fn_OnInputEnd orig_OnInputEnd = nullptr;
+static Fn_SendCommand orig_SendCommand = nullptr;
+static Fn_SendChat orig_SendChat = nullptr;
+static Fn_AddChatMessage orig_AddChatMessage = nullptr;
+static Fn_ShowDialog orig_ShowDialog = nullptr;
+
+static JNIEnv* g_LastJNIEnv = nullptr;
+static jobject g_LastJObject = nullptr;
+static void* g_LastNetGamePtr = nullptr;
+
+// Minimal JNI helper struct to read/create jbyteArray when JNIEnv is available
+struct JNINativeInterface_Partial {
+    void* reserved0;
+    void* reserved1;
+    void* reserved2;
+    void* reserved3;
+    int (*GetVersion)(JNIEnv*);
+    // Offsets match standard Android/iOS JNI table
+    void* funcs[220];
 };
 
-struct RebindingEntry {
-    Rebinding *rebindings;
-    size_t count;
-    RebindingEntry *next;
-};
+// ============================================================================
+// 2. ENCODING HELPERS (CP1251 <-> UTF-8)
+// ============================================================================
 
-static RebindingEntry *g_rebindings_head = nullptr;
-
-static void perform_rebinding_with_section(RebindingEntry *rebindings,
-                                           struct section_64 *section,
-                                           intptr_t slide,
-                                           struct nlist_64 *symtab,
-                                           char *strtab,
-                                           uint32_t *indirect_symtab) {
-    uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
-    void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
-
-    for (uint i = 0; i < section->size / sizeof(void *); i++) {
-        uint32_t symtab_index = indirect_symbol_indices[i];
-        if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
-            symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
-            continue;
-        }
-        uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
-        char *symbol_name = strtab + strtab_offset;
-        if (strnlen(symbol_name, 2) < 2) continue;
-
-        for (RebindingEntry *cur = rebindings; cur != nullptr; cur = cur->next) {
-            for (size_t j = 0; j < cur->count; j++) {
-                if (strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
-                    if (cur->rebindings[j].replaced != nullptr &&
-                        indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
-                        *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
-                    }
-                    vm_protect(mach_task_self(), (uintptr_t)indirect_symbol_bindings, section->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                    indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
-                    break;
-                }
-            }
-        }
+static std::string ToLowerASCII(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
+    return out;
 }
 
-static void rebind_symbols_for_image(RebindingEntry *rebindings, const struct mach_header *header, intptr_t slide) {
-    Dl_info info;
-    if (dladdr(header, &info) == 0) return;
+static std::string Cp1251ToUtf8(const std::string& str) {
+    // Check if already valid UTF-8
+    bool validUtf8 = true;
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        if (c < 0x80) { i++; }
+        else if ((c >> 5) == 0x6 && i + 1 < str.size() && (static_cast<unsigned char>(str[i+1]) >> 6) == 0x2) { i += 2; }
+        else if ((c >> 4) == 0xE && i + 2 < str.size() && (static_cast<unsigned char>(str[i+1]) >> 6) == 0x2 && (static_cast<unsigned char>(str[i+2]) >> 6) == 0x2) { i += 3; }
+        else if ((c >> 3) == 0x1E && i + 3 < str.size()) { i += 4; }
+        else { validUtf8 = false; break; }
+    }
+    if (validUtf8) return str;
 
-    struct segment_command_64 *cur_seg_cmd = nullptr;
-    struct segment_command_64 *linkedit_segment = nullptr;
-    struct symtab_command *symtab_cmd = nullptr;
-    struct dysymtab_command *dysymtab_cmd = nullptr;
-
-    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
-    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (struct segment_command_64 *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_64) {
-            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
-                linkedit_segment = cur_seg_cmd;
-            }
-        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
-        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
+    std::string out;
+    out.reserve(str.size() * 2);
+    for (unsigned char c : str) {
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+        } else if (c == 0xA8) { // Ё
+            out.append("\xD0\x81");
+        } else if (c == 0xB8) { // ё
+            out.append("\xD1\x91");
+        } else if (c >= 0xC0 && c <= 0xEF) { // А-Я, а-п
+            uint16_t cp = 0x0410 + (c - 0xC0);
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (c >= 0xF0) { // р-я
+            uint16_t cp = 0x0440 + (c - 0xF0);
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back('?');
         }
     }
+    return out;
+}
 
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || !dysymtab_cmd->nindirectsyms) return;
-
-    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
-    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
-    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
-
-    cur = (uintptr_t)header + sizeof(struct mach_header_64);
-    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (struct segment_command_64 *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_64) {
-            if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-                strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) {
-                continue;
-            }
-            for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
-                struct section_64 *sect = (struct section_64 *)(cur + sizeof(struct segment_command_64)) + j;
-                uint32_t flags = sect->flags & SECTION_TYPE;
-                if (flags == S_LAZY_SYMBOL_POINTERS || flags == S_NON_LAZY_SYMBOL_POINTERS) {
-                    perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
-                }
-            }
+static std::string Utf8ToCp1251(const std::string& str) {
+    std::string out;
+    out.reserve(str.size());
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            i++;
+        } else if ((c >> 5) == 0x6 && i + 1 < str.size()) {
+            uint16_t cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(str[i + 1]) & 0x3F);
+            if (cp == 0x0401) out.push_back(static_cast<char>(0xA8));
+            else if (cp == 0x0451) out.push_back(static_cast<char>(0xB8));
+            else if (cp >= 0x0410 && cp <= 0x044F) out.push_back(static_cast<char>(0xC0 + (cp - 0x0410)));
+            else out.push_back('?');
+            i += 2;
+        } else {
+            out.push_back('?');
+            i++;
         }
     }
+    return out;
 }
-
-static void _rebind_image_callback(const struct mach_header *header, intptr_t slide) {
-    rebind_symbols_for_image(g_rebindings_head, header, slide);
-}
-
-static int rebind_symbols(Rebinding rebindings[], size_t count) {
-    auto *entry = (RebindingEntry *)malloc(sizeof(RebindingEntry));
-    if (!entry) return -1;
-    entry->rebindings = (Rebinding *)malloc(sizeof(Rebinding) * count);
-    if (!entry->rebindings) {
-        free(entry);
-        return -1;
-    }
-    memcpy(entry->rebindings, rebindings, sizeof(Rebinding) * count);
-    entry->count = count;
-    entry->next = g_rebindings_head;
-
-    bool first = (g_rebindings_head == nullptr);
-    g_rebindings_head = entry;
-
-    if (first) {
-        _dyld_register_func_for_add_image(_rebind_image_callback);
-    } else {
-        uint32_t c = _dyld_image_count();
-        for (uint32_t i = 0; i < c; i++) {
-            _rebind_image_callback(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
-        }
-    }
-    return 0;
-}
-
-} // namespace Fishhook
 
 // ============================================================================
-// 2. Вспомогательные структуры данных, RAM-монитор, Трейсеры и Очереди рендера
+// 3. DATA STRUCTURES & GLOBAL STATE
 // ============================================================================
-static std::recursive_mutex g_luaMutex;
-static std::mutex g_logMutex;
-static std::mutex g_renderMutex;
 
-struct ScriptEntry {
-    std::string filename;
-    std::string fullPath;
-    bool enabled = true;
-    bool loaded = false;
-    std::string lastError;
-};
-
-struct LuaThreadTask {
-    int threadRef = LUA_NOREF;
-    lua_State *co = nullptr;
-    double wakeTime = 0.0;
+struct LuaCoroutine {
+    lua_State* co = nullptr;
+    int ref = LUA_NOREF;
+    uint64_t wakeTimeMs = 0;
+    bool suspended = false;
     bool finished = false;
 };
 
-struct TracerItem {
-    std::string id;
-    bool is3D = true;
-    float x1 = 0.0f, y1 = 0.0f, z1 = 0.0f;
-    float x2 = 0.0f, y2 = 0.0f;
-    uint32_t color = 0xFF9B59B6; // ARGB
-    float thickness = 1.6f;
-    std::string label;
+struct RegisteredCommand {
+    std::string scriptName;
+    lua_State* L = nullptr;
+    int funcRef = LUA_NOREF;
 };
 
-enum class DrawCmdType {
-    Line,
-    Box,
-    BoxFilled,
-    Circle,
-    CircleFilled,
-    Text
-};
-
-struct DrawCmd {
-    DrawCmdType type;
-    float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-    float radius = 0;
-    int segments = 24;
-    uint32_t color = 0xFFFFFFFF;
+struct ChatHistoryEntry {
     std::string text;
+    std::string prefix;
+    uint32_t color = 0xFFFFFFFF;
+    uint32_t pcolor = 0xFFFFFFFF;
 };
 
-struct CameraState {
-    float camX = 0.0f, camY = 0.0f, camZ = 10.0f;
-    float lookX = 0.0f, lookY = 10.0f, lookZ = 10.0f;
-    float fovDeg = 70.0f;
-    bool valid = false;
+struct LuaScriptInstance {
+    std::string filename;
+    std::string fullPath;
+    std::string displayName;
+    lua_State* L = nullptr;
+    bool enabled = true;
+    bool hasError = false;
+    std::string lastError;
+    std::vector<LuaCoroutine> threads;
+    int renderCallbackRef = LUA_NOREF;
 };
 
-static std::vector<std::string> g_consoleLogs;
-static std::vector<DrawCmd> g_luaDrawQueue;
-static std::unordered_map<std::string, TracerItem> g_tracers;
-static CameraState g_camera;
-
-// Настройки встроенного ImGui интерфейса и HUD
-static bool g_showImGuiMenu = false;
-static bool g_showFloatingBtn = true;
-static bool g_showRamHud = true;
-static bool g_renderEnabled = true;
-static bool g_drawCrosshair = false;
-static bool g_drawDemoTracers = false;
-static bool g_tracerFromCenter = false; // false = снизу по центру, true = из центра экрана
-static float g_tracerThickness = 1.6f;
-static float g_tracerColor[4] = { 0.65f, 0.35f, 0.98f, 0.90f };
-static float g_crosshairSize = 8.0f;
-static float g_crosshairColor[4] = { 0.30f, 0.95f, 0.55f, 0.90f };
-
-// Статистика памяти именно лоадера
-struct LoaderRamStats {
-    size_t dylibImageBytes = 0;
-    size_t luaHeapBytes = 0;
-    size_t buffersBytes = 0;
-    size_t totalBytes = 0;
+struct OverlayNotification {
+    std::string title;
+    std::string message;
+    uint64_t expireMs;
 };
-static LoaderRamStats g_ramStats;
-static CFTimeInterval g_lastRamUpdate = 0;
 
-static void AppendConsoleLog(const std::string &line) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
-    g_consoleLogs.push_back(line);
-    if (g_consoleLogs.size() > 300) {
-        g_consoleLogs.erase(g_consoleLogs.begin(), g_consoleLogs.begin() + 50);
-    }
-    NSLog(@"[42Loader] %s", line.c_str());
+struct TracerItem {
+    int id;
+    float x1, y1, z1;
+    float x2, y2, z2;
+    bool is2D;
+    uint32_t color;
+    float thickness;
+};
+
+static std::recursive_mutex g_EngineMutex;
+static std::vector<LuaScriptInstance*> g_Scripts;
+static std::unordered_map<std::string, RegisteredCommand> g_ChatCommands;
+static std::vector<std::string> g_ConsoleLogs;
+static std::vector<ChatHistoryEntry> g_ChatHistory;
+static std::vector<OverlayNotification> g_Notifications;
+static std::vector<TracerItem> g_Tracers;
+
+static bool g_MenuOpen = false;
+static int g_SelectedTab = 0;
+static char g_CmdInputBuf[256] = {0};
+
+// Game state & virtual world overrides for MoonLoader APIs
+static int g_CurrentDialogId = -1;
+static int g_CurrentDialogStyle = 0;
+static bool g_IsDialogActive = false;
+static std::string g_CurrentDialogTitle;
+static std::string g_CurrentDialogText;
+static std::string g_ChatInputText;
+static bool g_IsChatInputActive = false;
+static int g_WorldHour = 12;
+static int g_WorldMinute = 0;
+static int g_WorldWeather = 1;
+
+// Deduplication guard between UIKit UITextField hook and JNI OnInputEnd hook
+static std::string g_LastInterceptedCmd;
+static uint64_t g_LastInterceptedMs = 0;
+
+static uint64_t NowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-static NSString *SafeNSString(const char *str) {
-    if (!str) return @"";
-    NSString *s = [NSString stringWithUTF8String:str];
-    if (s) return s;
-    s = [[NSString alloc] initWithCString:str encoding:NSWindowsCP1251StringEncoding];
-    if (s) return s;
-    return [[NSString alloc] initWithCString:str encoding:NSISOLatin1StringEncoding] ?: @"";
+static std::string GetBaseDir() {
+    NSArray* paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString* docs = [paths firstObject];
+    return std::string([docs UTF8String]) + "/lua_loader";
 }
 
-static UIWindow *GetActiveKeyWindow() {
-    UIWindow *found = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)scene;
-        for (UIWindow *win in ws.windows) {
-            if (win.isKeyWindow) return win;
-            if (!found && win.windowLevel == UIWindowLevelNormal && !win.hidden) {
-                found = win;
-            }
-        }
+static std::string ShortenPathForUI(const std::string& raw) {
+    size_t pos = raw.find("/Documents/");
+    if (pos != std::string::npos) {
+        return raw.substr(pos + 1); // "Documents/lua_loader/..."
     }
-    return found;
+    return raw;
 }
 
-static ImU32 ARGBToImU32(uint32_t argb) {
-    uint8_t a = (argb >> 24) & 0xFF;
-    uint8_t r = (argb >> 16) & 0xFF;
-    uint8_t g = (argb >> 8) & 0xFF;
-    uint8_t b = argb & 0xFF;
-    if (a == 0) a = 0xFF;
-    return IM_COL32(r, g, b, a);
-}
-
-static ImU32 Float4ToImU32(const float c[4]) {
-    return IM_COL32((uint8_t)(c[0] * 255.0f),
-                    (uint8_t)(c[1] * 255.0f),
-                    (uint8_t)(c[2] * 255.0f),
-                    (uint8_t)(c[3] * 255.0f));
-}
-
-// Подсчет размера сегментов самого LuaLoader.dylib в памяти процесса
-static size_t ComputeLoaderMachOBytes() {
-    static size_t cachedSize = 0;
-    if (cachedSize > 0) return cachedSize;
-
-    Dl_info info;
-    if (dladdr((void *)&ComputeLoaderMachOBytes, &info) == 0 || !info.dli_fbase) {
-        return 0;
+static void LogConsole(const std::string& line) {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    std::string clean = ShortenPathForUI(line);
+    g_ConsoleLogs.push_back(clean);
+    if (g_ConsoleLogs.size() > 300) {
+        g_ConsoleLogs.erase(g_ConsoleLogs.begin());
     }
-    const auto *header = (const struct mach_header_64 *)info.dli_fbase;
-    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
-    size_t total = 0;
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        const auto *cmd = (const struct load_command *)cur;
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const auto *seg = (const struct segment_command_64 *)cur;
-            if (strcmp(seg->segname, SEG_PAGEZERO) != 0) {
-                total += (size_t)seg->vmsize;
-            }
-        }
-        cur += cmd->cmdsize;
-    }
-    cachedSize = total;
-    return cachedSize;
-}
+    NSLog(@"[42Loader] %s", clean.c_str());
 
-static void UpdateLoaderRamStats(lua_State *L) {
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now - g_lastRamUpdate < 0.5 && g_ramStats.totalBytes > 0) return;
-    g_lastRamUpdate = now;
-
-    size_t luaBytes = 0;
-    if (L) {
-        std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-        int kb = lua_gc(L, LUA_GCCOUNT, 0);
-        int rem = lua_gc(L, LUA_GCCOUNTB, 0);
-        luaBytes = (size_t)kb * 1024 + (size_t)rem;
-    }
-
-    size_t dylibBytes = ComputeLoaderMachOBytes();
-
-    size_t bufBytes = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_logMutex);
-        for (const auto &s : g_consoleLogs) bufBytes += s.capacity() + sizeof(std::string);
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_renderMutex);
-        bufBytes += g_luaDrawQueue.capacity() * sizeof(DrawCmd);
-        bufBytes += g_tracers.size() * (sizeof(TracerItem) + 48);
-    }
-    if (ImGui::GetCurrentContext()) {
-        ImGuiIO &io = ImGui::GetIO();
-        // Атлас шрифтов ImGui (RGBA32) + вершинные буферы
-        if (io.Fonts && io.Fonts->TexWidth > 0 && io.Fonts->TexHeight > 0) {
-            bufBytes += (size_t)io.Fonts->TexWidth * (size_t)io.Fonts->TexHeight * 4;
-        }
-        bufBytes += (size_t)io.MetricsRenderVertices * sizeof(ImDrawVert);
-        bufBytes += (size_t)io.MetricsRenderIndices * sizeof(ImDrawIdx);
-    }
-
-    g_ramStats.dylibImageBytes = dylibBytes;
-    g_ramStats.luaHeapBytes = luaBytes;
-    g_ramStats.buffersBytes = bufBytes;
-    g_ramStats.totalBytes = dylibBytes + luaBytes + bufBytes;
-}
-
-// Проекция 3D мировых координат в 2D координаты экрана
-static bool ProjectWorldToScreen(float wx, float wy, float wz, float screenW, float screenH, float &outX, float &outY) {
-    if (!g_camera.valid) {
-        // Fallback проекция относительно центра мира, если камера не задана скриптом
-        float dx = wx - g_camera.camX;
-        float dy = wy - g_camera.camY;
-        float dz = wz - g_camera.camZ;
-        if (dy <= 0.5f) return false;
-        float aspect = (screenH > 0) ? (screenW / screenH) : 1.77f;
-        float fovRad = g_camera.fovDeg * (float)M_PI / 180.0f;
-        float f = 1.0f / tanf(fovRad * 0.5f);
-        float ndcX = (dx * f / aspect) / dy;
-        float ndcY = (dz * f) / dy;
-        outX = (ndcX + 1.0f) * 0.5f * screenW;
-        outY = (1.0f - ndcY) * 0.5f * screenH;
-        return (outX >= -200.0f && outX <= screenW + 200.0f && outY >= -200.0f && outY <= screenH + 200.0f);
-    }
-
-    // Вектор взгляда forward = normalize(look - cam)
-    float fx = g_camera.lookX - g_camera.camX;
-    float fy = g_camera.lookY - g_camera.camY;
-    float fz = g_camera.lookZ - g_camera.camZ;
-    float flen = sqrtf(fx * fx + fy * fy + fz * fz);
-    if (flen < 1e-4f) return false;
-    fx /= flen; fy /= flen; fz /= flen;
-
-    // right = normalize(forward x up(0,0,1))
-    float rx = fy * 1.0f - fz * 0.0f;
-    float ry = fz * 0.0f - fx * 1.0f;
-    float rz = fx * 0.0f - fy * 0.0f;
-    float rlen = sqrtf(rx * rx + ry * ry + rz * rz);
-    if (rlen < 1e-4f) { rx = 1.0f; ry = 0.0f; rz = 0.0f; }
-    else { rx /= rlen; ry /= rlen; rz /= rlen; }
-
-    // up = right x forward
-    float ux = ry * fz - rz * fy;
-    float uy = rz * fx - rx * fz;
-    float uz = rx * fy - ry * fx;
-
-    float dx = wx - g_camera.camX;
-    float dy = wy - g_camera.camY;
-    float dz = wz - g_camera.camZ;
-
-    float camSpaceZ = dx * fx + dy * fy + dz * fz;
-    if (camSpaceZ <= 0.1f) return false;
-
-    float camSpaceX = dx * rx + dy * ry + dz * rz;
-    float camSpaceY = dx * ux + dy * uy + dz * uz;
-
-    float aspect = (screenH > 0) ? (screenW / screenH) : 1.77f;
-    float fovRad = g_camera.fovDeg * (float)M_PI / 180.0f;
-    float tanHalfFov = tanf(fovRad * 0.5f);
-
-    float ndcX = camSpaceX / (camSpaceZ * tanHalfFov * aspect);
-    float ndcY = camSpaceY / (camSpaceZ * tanHalfFov);
-
-    outX = (ndcX + 1.0f) * 0.5f * screenW;
-    outY = (1.0f - ndcY) * 0.5f * screenH;
-    return true;
-}
-
-// ============================================================================
-// 3. Объявление главного класса движка лоадера
-// ============================================================================
-@interface LoaderEngine : NSObject <UNUserNotificationCenterDelegate>
-@property (nonatomic, assign) lua_State *L;
-@property (nonatomic, assign) BOOL inGameSession;
-@property (nonatomic, strong) NSString *baseDir;
-@property (nonatomic, strong) NSString *scriptsDir;
-@property (nonatomic, strong) NSString *configDir;
-@property (nonatomic, strong) NSString *libDir;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *commandRefs;
-@property (nonatomic, strong) NSMutableArray<NSNumber *> *frameCallbackRefs;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *disabledScripts;
-@property (nonatomic, assign) int currentDialogId;
-@property (nonatomic, assign) BOOL dialogActive;
-@property (nonatomic, strong) NSString *chatInputText;
-@property (nonatomic, assign) BOOL chatInputActive;
-
-+ (instancetype)shared;
-- (void)boot;
-- (void)reloadAllScripts;
-- (BOOL)loadSingleScript:(NSString *)filename;
-- (void)setScript:(NSString *)filename enabled:(BOOL)enabled;
-- (std::vector<ScriptEntry>)allScriptsStatus;
-- (void)tickUpdate;
-- (void)tickRender;
-- (BOOL)dispatchServerMessage:(uint32_t)color text:(NSString *)text outColor:(uint32_t *)outColor outText:(NSString **)outText;
-- (BOOL)dispatchShowDialog:(int)dialogId style:(int)style title:(NSString *)title btn1:(NSString *)btn1 btn2:(NSString *)btn2 text:(NSString *)text;
-- (BOOL)dispatchOutgoingText:(NSString *)text;
-- (void)sendChatToGame:(NSString *)text;
-- (void)addChatMessageLocal:(NSString *)text color:(uint32_t)color;
-- (void)executeLuaString:(NSString *)code;
-@end
-
-static std::vector<LuaThreadTask> g_luaThreads;
-
-// ============================================================================
-// 4. Хуки игры (fishhook + dlsym + UIKit swizzling)
-// ============================================================================
-typedef void (*AddChatMessage_t)(uint32_t color, const char *text);
-typedef void (*ShowDialog_t)(int dialogId, int style, const char *title, const char *btn1, const char *btn2, const char *text);
-typedef void (*SendChatMessage_t)(void *env, void *thiz, void *jstr);
-
-static AddChatMessage_t orig_AddChatMessage = nullptr;
-static ShowDialog_t orig_ShowDialog = nullptr;
-
-static void hooked_AddChatMessage(uint32_t color, const char *text) {
-    NSString *nsText = SafeNSString(text);
-    uint32_t outColor = color;
-    NSString *outText = nil;
-
-    BOOL allow = [[LoaderEngine shared] dispatchServerMessage:color text:nsText outColor:&outColor outText:&outText];
-    if (!allow) return;
-
-    if (orig_AddChatMessage) {
-        const char *finalCStr = outText ? [outText UTF8String] : text;
-        orig_AddChatMessage(outColor, finalCStr);
+    std::string logPath = GetBaseDir() + "/loader.log";
+    FILE* f = fopen(logPath.c_str(), "a");
+    if (f) {
+        fprintf(f, "%s\n", clean.c_str());
+        fclose(f);
     }
 }
 
-static void hooked_ShowDialog(int dialogId, int style, const char *title, const char *btn1, const char *btn2, const char *text) {
-    [LoaderEngine shared].currentDialogId = dialogId;
-    [LoaderEngine shared].dialogActive = YES;
-
-    BOOL allow = [[LoaderEngine shared] dispatchShowDialog:dialogId
-                                                     style:style
-                                                     title:SafeNSString(title)
-                                                      btn1:SafeNSString(btn1)
-                                                      btn2:SafeNSString(btn2)
-                                                      text:SafeNSString(text)];
-    if (!allow) {
-        [LoaderEngine shared].dialogActive = NO;
-        return;
-    }
-    if (orig_ShowDialog) {
-        orig_ShowDialog(dialogId, style, title, btn1, btn2, text);
-    }
-}
-
-// ============================================================================
-// 5. Lua C-API функции (MoonLoader / Arizona / ImGui / Render / Tracers)
-// ============================================================================
-
-// --- print(...) -> в консоль ImGui и NSLog ---
-static int l_print(lua_State *L) {
-    int n = lua_gettop(L);
-    std::string out;
-    for (int i = 1; i <= n; i++) {
-        size_t len = 0;
-        const char *s = luaL_tolstring(L, i, &len);
-        if (i > 1) out += "\t";
-        if (s) out += std::string(s, len);
-        lua_pop(L, 1);
-    }
-    AppendConsoleLog(out);
-    return 0;
-}
-
-// --- Корутины: wait(ms) и lua_thread.create(fn, ...) ---
-static int l_wait(lua_State *L) {
-    double ms = luaL_checknumber(L, 1);
-    if (!lua_isyieldable(L)) {
-        return luaL_error(L, "wait() can only be called inside lua_thread.create()");
-    }
-    double wake = CACurrentMediaTime() + (ms / 1000.0);
-    for (auto &t : g_luaThreads) {
-        if (t.co == L) {
-            t.wakeTime = wake;
-            break;
-        }
-    }
-    return lua_yield(L, 0);
-}
-
-static int l_lua_thread_create(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    int nargs = lua_gettop(L) - 1;
-
-    lua_State *co = lua_newthread(L);
-    int threadRef = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    lua_pushvalue(L, 1);
-    for (int i = 0; i < nargs; i++) {
-        lua_pushvalue(L, 2 + i);
-    }
-    lua_xmove(L, co, 1 + nargs);
-
-    LuaThreadTask task;
-    task.threadRef = threadRef;
-    task.co = co;
-    task.wakeTime = 0.0;
-    task.finished = false;
-
-    int nres = 0;
-    int status = lua_resume(co, L, nargs, &nres);
-    if (status == LUA_OK) {
-        task.finished = true;
-        luaL_unref(L, LUA_REGISTRYINDEX, threadRef);
-    } else if (status == LUA_YIELD) {
-        if (nres > 0) lua_pop(co, nres);
-        g_luaThreads.push_back(task);
-    } else {
-        const char *err = lua_tostring(co, -1);
-        AppendConsoleLog(std::string("[lua_thread error] ") + (err ? err : "unknown"));
-        luaL_unref(L, LUA_REGISTRYINDEX, threadRef);
-    }
-    return 0;
-}
-
-// --- SA-MP / Arizona функции ---
-static int l_sampAddChatMessage(lua_State *L) {
-    const char *text = luaL_checkstring(L, 1);
-    uint32_t color = (uint32_t)luaL_optinteger(L, 2, 0xFFFFFFFF);
-    [[LoaderEngine shared] addChatMessageLocal:SafeNSString(text) color:color];
-    return 0;
-}
-
-static int l_sampSendChat(lua_State *L) {
-    const char *text = luaL_checkstring(L, 1);
-    [[LoaderEngine shared] sendChatToGame:SafeNSString(text)];
-    return 0;
-}
-
-static int l_sampRegisterChatCommand(lua_State *L) {
-    const char *cmd = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-    NSString *key = [SafeNSString(cmd) lowercaseString];
-    if ([key hasPrefix:@"/"]) key = [key substringFromIndex:1];
-
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSNumber *oldRef = eng.commandRefs[key];
-    if (oldRef) {
-        luaL_unref(L, LUA_REGISTRYINDEX, [oldRef intValue]);
-    }
-    lua_pushvalue(L, 2);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    eng.commandRefs[key] = @(ref);
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int l_sampUnregisterChatCommand(lua_State *L) {
-    const char *cmd = luaL_checkstring(L, 1);
-    NSString *key = [SafeNSString(cmd) lowercaseString];
-    if ([key hasPrefix:@"/"]) key = [key substringFromIndex:1];
-
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSNumber *oldRef = eng.commandRefs[key];
-    if (oldRef) {
-        luaL_unref(L, LUA_REGISTRYINDEX, [oldRef intValue]);
-        [eng.commandRefs removeObjectForKey:key];
-        lua_pushboolean(L, 1);
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-static int l_sampShowDialog(lua_State *L) {
-    int dialogId = (int)luaL_checkinteger(L, 1);
-    const char *caption = luaL_checkstring(L, 2);
-    const char *text = luaL_checkstring(L, 3);
-    const char *btn1 = luaL_checkstring(L, 4);
-    const char *btn2 = luaL_optstring(L, 5, "");
-    int style = (int)luaL_optinteger(L, 6, 0);
-
-    [LoaderEngine shared].currentDialogId = dialogId;
-    [LoaderEngine shared].dialogActive = YES;
-
-    if (orig_ShowDialog) {
-        orig_ShowDialog(dialogId, style, caption, btn1, btn2, text);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIWindow *win = GetActiveKeyWindow();
-            UIViewController *vc = win.rootViewController;
-            while (vc.presentedViewController) vc = vc.presentedViewController;
-            if (!vc) return;
-
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:SafeNSString(caption)
-                                                                        message:SafeNSString(text)
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:SafeNSString(btn1) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                [LoaderEngine shared].dialogActive = NO;
-            }]];
-            if (strlen(btn2) > 0) {
-                [ac addAction:[UIAlertAction actionWithTitle:SafeNSString(btn2) style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-                    [LoaderEngine shared].dialogActive = NO;
-                }]];
-            }
-            [vc presentViewController:ac animated:YES completion:nil];
-        });
-    }
-    return 0;
-}
-
-static int l_sampGetCurrentDialogId(lua_State *L) {
-    lua_pushinteger(L, [LoaderEngine shared].currentDialogId);
-    return 1;
-}
-
-static int l_sampIsDialogActive(lua_State *L) {
-    lua_pushboolean(L, [LoaderEngine shared].dialogActive ? 1 : 0);
-    return 1;
-}
-
-static int l_sampIsChatInputActive(lua_State *L) {
-    lua_pushboolean(L, [LoaderEngine shared].chatInputActive ? 1 : 0);
-    return 1;
-}
-
-static int l_sampGetChatInputText(lua_State *L) {
-    NSString *t = [LoaderEngine shared].chatInputText ?: @"";
-    lua_pushstring(L, [t UTF8String]);
-    return 1;
-}
-
-static int l_isSampAvailable(lua_State *L) {
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int l_sampGetGamestate(lua_State *L) {
-    lua_pushinteger(L, [LoaderEngine shared].inGameSession ? 3 : 1);
-    return 1;
-}
-
-// --- az.* Native iOS & Tracers API ---
-static int l_az_notify(lua_State *L) {
-    NSString *title = SafeNSString(luaL_checkstring(L, 1));
-    NSString *body = SafeNSString(luaL_checkstring(L, 2));
-    double delay = luaL_optnumber(L, 3, 0.1);
-    if (delay < 0.05) delay = 0.05;
-
-    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-    content.title = title;
-    content.body = body;
-    content.sound = [UNNotificationSound defaultSound];
-
-    UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:delay repeats:NO];
-    NSString *ident = [[NSUUID UUID] UUIDString];
-    UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:ident content:content trigger:trigger];
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:nil];
-    return 0;
-}
-
-static int l_az_vibrate(lua_State *L) {
-    const char *styleStr = luaL_optstring(L, 1, "medium");
-    std::string st(styleStr);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (st == "success" || st == "warning" || st == "error") {
-            UINotificationFeedbackGenerator *gen = [[UINotificationFeedbackGenerator alloc] init];
-            [gen prepare];
-            UINotificationFeedbackType t = UINotificationFeedbackTypeSuccess;
-            if (st == "warning") t = UINotificationFeedbackTypeWarning;
-            else if (st == "error") t = UINotificationFeedbackTypeError;
-            [gen notificationOccurred:t];
-        } else {
-            UIImpactFeedbackStyle style = UIImpactFeedbackStyleMedium;
-            if (st == "light") style = UIImpactFeedbackStyleLight;
-            else if (st == "heavy") style = UIImpactFeedbackStyleHeavy;
-            UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:style];
-            [gen prepare];
-            [gen impactOccurred];
-        }
-    });
-    return 0;
-}
-
-static int l_az_setClipboard(lua_State *L) {
-    NSString *s = SafeNSString(luaL_checkstring(L, 1));
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIPasteboard generalPasteboard].string = s;
-    });
-    return 0;
-}
-
-static int l_az_getClipboard(lua_State *L) {
-    __block NSString *res = @"";
-    if ([NSThread isMainThread]) {
-        res = [UIPasteboard generalPasteboard].string ?: @"";
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            res = [UIPasteboard generalPasteboard].string ?: @"";
-        });
-    }
-    lua_pushstring(L, [res UTF8String]);
-    return 1;
-}
-
-static int l_az_openURL(lua_State *L) {
-    NSString *urlStr = SafeNSString(luaL_checkstring(L, 1));
-    NSURL *url = [NSURL URLWithString:urlStr];
-    if (url) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
-        });
-    }
-    return 0;
-}
-
-static int l_az_getLoaderRAM(lua_State *L) {
-    UpdateLoaderRamStats(L);
-    lua_pushnumber(L, (double)g_ramStats.totalBytes / (1024.0 * 1024.0));
-    lua_pushinteger(L, (lua_Integer)g_ramStats.totalBytes);
-    lua_pushinteger(L, (lua_Integer)g_ramStats.luaHeapBytes);
-    return 3;
-}
-
-static int l_az_setCamera(lua_State *L) {
-    g_camera.camX = (float)luaL_checknumber(L, 1);
-    g_camera.camY = (float)luaL_checknumber(L, 2);
-    g_camera.camZ = (float)luaL_checknumber(L, 3);
-    g_camera.lookX = (float)luaL_checknumber(L, 4);
-    g_camera.lookY = (float)luaL_checknumber(L, 5);
-    g_camera.lookZ = (float)luaL_checknumber(L, 6);
-    g_camera.fovDeg = (float)luaL_optnumber(L, 7, 70.0);
-    g_camera.valid = true;
-    return 0;
-}
-
-// az.addTracer(id, x, y, z, color, label)
-static int l_az_addTracer(lua_State *L) {
-    const char *id = luaL_checkstring(L, 1);
-    TracerItem item;
-    item.id = id;
-    item.is3D = true;
-    item.x1 = (float)luaL_checknumber(L, 2);
-    item.y1 = (float)luaL_checknumber(L, 3);
-    item.z1 = (float)luaL_checknumber(L, 4);
-    item.color = (uint32_t)luaL_optinteger(L, 5, 0xFF9B59B6);
-    item.label = luaL_optstring(L, 6, "");
-    item.thickness = (float)luaL_optnumber(L, 7, 1.6);
-
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_tracers[item.id] = item;
-    return 0;
-}
-
-// az.addScreenTracer(id, x1, y1, x2, y2, color, thickness, label)
-static int l_az_addScreenTracer(lua_State *L) {
-    const char *id = luaL_checkstring(L, 1);
-    TracerItem item;
-    item.id = id;
-    item.is3D = false;
-    item.x1 = (float)luaL_checknumber(L, 2);
-    item.y1 = (float)luaL_checknumber(L, 3);
-    item.x2 = (float)luaL_checknumber(L, 4);
-    item.y2 = (float)luaL_checknumber(L, 5);
-    item.color = (uint32_t)luaL_optinteger(L, 6, 0xFF9B59B6);
-    item.thickness = (float)luaL_optnumber(L, 7, 1.6);
-    item.label = luaL_optstring(L, 8, "");
-
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_tracers[item.id] = item;
-    return 0;
-}
-
-static int l_az_removeTracer(lua_State *L) {
-    const char *id = luaL_checkstring(L, 1);
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_tracers.erase(id);
-    return 0;
-}
-
-static int l_az_clearTracers(lua_State *L) {
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_tracers.clear();
-    return 0;
-}
-
-// --- 2D Render API (MoonLoader-совместимый) ---
-static int l_getScreenResolution(lua_State *L) {
-    CGSize sz = [UIScreen mainScreen].bounds.size;
-    lua_pushnumber(L, sz.width);
-    lua_pushnumber(L, sz.height);
-    return 2;
-}
-
-static int l_convert3DCoordsToScreen(lua_State *L) {
-    float wx = (float)luaL_checknumber(L, 1);
-    float wy = (float)luaL_checknumber(L, 2);
-    float wz = (float)luaL_checknumber(L, 3);
-    CGSize sz = [UIScreen mainScreen].bounds.size;
-    float sx = 0, sy = 0;
-    bool vis = ProjectWorldToScreen(wx, wy, wz, (float)sz.width, (float)sz.height, sx, sy);
-    lua_pushboolean(L, vis ? 1 : 0);
-    lua_pushnumber(L, sx);
-    lua_pushnumber(L, sy);
-    return 3;
-}
-
-static int l_renderDrawLine(lua_State *L) {
-    DrawCmd c;
-    c.type = DrawCmdType::Line;
-    c.x1 = (float)luaL_checknumber(L, 1);
-    c.y1 = (float)luaL_checknumber(L, 2);
-    c.x2 = (float)luaL_checknumber(L, 3);
-    c.y2 = (float)luaL_checknumber(L, 4);
-    c.radius = (float)luaL_optnumber(L, 5, 1.0); // width
-    c.color = (uint32_t)luaL_optinteger(L, 6, 0xFFFFFFFF);
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_luaDrawQueue.push_back(c);
-    return 0;
-}
-
-static int l_renderDrawBox(lua_State *L) {
-    DrawCmd c;
-    c.type = DrawCmdType::BoxFilled;
-    c.x1 = (float)luaL_checknumber(L, 1);
-    c.y1 = (float)luaL_checknumber(L, 2);
-    c.x2 = (float)luaL_checknumber(L, 3); // w
-    c.y2 = (float)luaL_checknumber(L, 4); // h
-    c.color = (uint32_t)luaL_optinteger(L, 5, 0x80000000);
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_luaDrawQueue.push_back(c);
-    return 0;
-}
-
-static int l_renderDrawCircle(lua_State *L) {
-    DrawCmd c;
-    c.type = DrawCmdType::Circle;
-    c.x1 = (float)luaL_checknumber(L, 1);
-    c.y1 = (float)luaL_checknumber(L, 2);
-    c.radius = (float)luaL_checknumber(L, 3);
-    c.segments = (int)luaL_optinteger(L, 4, 24);
-    c.color = (uint32_t)luaL_optinteger(L, 5, 0xFFFFFFFF);
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_luaDrawQueue.push_back(c);
-    return 0;
-}
-
-static int l_renderDrawText(lua_State *L) {
-    DrawCmd c;
-    c.type = DrawCmdType::Text;
-    c.text = luaL_checkstring(L, 1);
-    c.x1 = (float)luaL_checknumber(L, 2);
-    c.y1 = (float)luaL_checknumber(L, 3);
-    c.color = (uint32_t)luaL_optinteger(L, 4, 0xFFFFFFFF);
-    c.radius = (float)luaL_optnumber(L, 5, 13.0);
-    std::lock_guard<std::mutex> lock(g_renderMutex);
-    g_luaDrawQueue.push_back(c);
-    return 0;
-}
-
-// --- Async HTTP Request (NSURLSession) ---
-static int l_asyncHttpRequest(lua_State *L) {
-    NSString *method = [SafeNSString(luaL_checkstring(L, 1)) uppercaseString];
-    NSString *urlStr = SafeNSString(luaL_checkstring(L, 2));
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
-    req.HTTPMethod = method;
-    req.timeoutInterval = 15.0;
-
-    if (lua_istable(L, 3)) {
-        lua_getfield(L, 3, "headers");
-        if (lua_istable(L, -1)) {
-            lua_pushnil(L);
-            while (lua_next(L, -2) != 0) {
-                if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
-                    [req setValue:SafeNSString(lua_tostring(L, -1))
-               forHTTPHeaderField:SafeNSString(lua_tostring(L, -2))];
-                }
-                lua_pop(L, 1);
-            }
-        }
-        lua_pop(L, 1);
-
-        lua_getfield(L, 3, "data");
-        if (lua_isstring(L, -1)) {
-            size_t len = 0;
-            const char *data = lua_tolstring(L, -1, &len);
-            req.HTTPBody = [NSData dataWithBytes:data length:len];
-        }
-        lua_pop(L, 1);
-    }
-
-    int resolveRef = LUA_NOREF;
-    int rejectRef = LUA_NOREF;
-    if (lua_isfunction(L, 4)) {
-        lua_pushvalue(L, 4);
-        resolveRef = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
-    if (lua_isfunction(L, 5)) {
-        lua_pushvalue(L, 5);
-        rejectRef = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-            lua_State *mainL = [LoaderEngine shared].L;
-            if (!mainL) return;
-
-            if (error) {
-                if (rejectRef != LUA_NOREF) {
-                    lua_rawgeti(mainL, LUA_REGISTRYINDEX, rejectRef);
-                    lua_pushstring(mainL, [[error localizedDescription] UTF8String]);
-                    if (lua_pcall(mainL, 1, 0, 0) != LUA_OK) {
-                        AppendConsoleLog(std::string("[HTTP reject err] ") + (lua_tostring(mainL, -1) ?: ""));
-                        lua_pop(mainL, 1);
-                    }
-                }
-            } else if (resolveRef != LUA_NOREF) {
-                lua_rawgeti(mainL, LUA_REGISTRYINDEX, resolveRef);
-                lua_newtable(mainL);
-
-                NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-                lua_pushinteger(mainL, httpResp ? httpResp.statusCode : 200);
-                lua_setfield(mainL, -2, "status_code");
-
-                if (data && data.length > 0) {
-                    lua_pushlstring(mainL, (const char *)data.bytes, data.length);
-                } else {
-                    lua_pushstring(mainL, "");
-                }
-                lua_setfield(mainL, -2, "text");
-
-                if (lua_pcall(mainL, 1, 0, 0) != LUA_OK) {
-                    AppendConsoleLog(std::string("[HTTP resolve err] ") + (lua_tostring(mainL, -1) ?: ""));
-                    lua_pop(mainL, 1);
-                }
-            }
-
-            if (resolveRef != LUA_NOREF) luaL_unref(mainL, LUA_REGISTRYINDEX, resolveRef);
-            if (rejectRef != LUA_NOREF) luaL_unref(mainL, LUA_REGISTRYINDEX, rejectRef);
-        });
-    }];
-    [task resume];
-    return 0;
-}
-
-// ============================================================================
-// 6. Dear ImGui Lua 5.4 Bindings (imgui / mimgui API для скриптов)
-// ============================================================================
-static int l_imgui_Begin(lua_State *L) {
-    const char *name = luaL_checkstring(L, 1);
-    bool *p_open = nullptr;
-    bool openVal = true;
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "v");
-        openVal = lua_toboolean(L, -1);
-        lua_pop(L, 1);
-        p_open = &openVal;
-    }
-    ImGuiWindowFlags flags = (ImGuiWindowFlags)luaL_optinteger(L, 3, 0);
-    bool shown = ImGui::Begin(name, p_open, flags);
-    if (p_open && lua_istable(L, 2)) {
-        lua_pushboolean(L, openVal ? 1 : 0);
-        lua_setfield(L, 2, "v");
-    }
-    lua_pushboolean(L, shown ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_End(lua_State *L) {
-    ImGui::End();
-    return 0;
-}
-
-static int l_imgui_BeginChild(lua_State *L) {
-    const char *id = luaL_checkstring(L, 1);
-    float w = 0, h = 0;
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "x"); w = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "y"); h = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-    }
-    bool border = lua_toboolean(L, 3);
-    ImGuiWindowFlags flags = (ImGuiWindowFlags)luaL_optinteger(L, 4, 0);
-    lua_pushboolean(L, ImGui::BeginChild(id, ImVec2(w, h), border, flags) ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_EndChild(lua_State *L) {
-    ImGui::EndChild();
-    return 0;
-}
-
-static int l_imgui_Text(lua_State *L) {
-    const char *txt = luaL_checkstring(L, 1);
-    ImGui::TextUnformatted(txt);
-    return 0;
-}
-
-static int l_imgui_TextColored(lua_State *L) {
-    ImVec4 col(1, 1, 1, 1);
-    if (lua_istable(L, 1)) {
-        lua_getfield(L, 1, "x"); col.x = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 1, "y"); col.y = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 1, "z"); col.z = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 1, "w"); col.w = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-    }
-    const char *txt = luaL_checkstring(L, 2);
-    ImGui::TextColored(col, "%s", txt);
-    return 0;
-}
-
-static int l_imgui_Button(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    float w = 0, h = 0;
-    if (lua_istable(L, 2)) {
-        lua_getfield(L, 2, "x"); w = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 2, "y"); h = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-    }
-    lua_pushboolean(L, ImGui::Button(label, ImVec2(w, h)) ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_Checkbox(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-    lua_getfield(L, 2, "v");
-    bool val = lua_toboolean(L, -1);
-    lua_pop(L, 1);
-
-    bool changed = ImGui::Checkbox(label, &val);
-    if (changed) {
-        lua_pushboolean(L, val ? 1 : 0);
-        lua_setfield(L, 2, "v");
-    }
-    lua_pushboolean(L, changed ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_SliderFloat(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-    float v_min = (float)luaL_checknumber(L, 3);
-    float v_max = (float)luaL_checknumber(L, 4);
-    const char *fmt = luaL_optstring(L, 5, "%.2f");
-
-    lua_getfield(L, 2, "v");
-    float val = (float)lua_tonumber(L, -1);
-    lua_pop(L, 1);
-
-    bool changed = ImGui::SliderFloat(label, &val, v_min, v_max, fmt);
-    if (changed) {
-        lua_pushnumber(L, val);
-        lua_setfield(L, 2, "v");
-    }
-    lua_pushboolean(L, changed ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_SliderInt(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-    int v_min = (int)luaL_checkinteger(L, 3);
-    int v_max = (int)luaL_checkinteger(L, 4);
-
-    lua_getfield(L, 2, "v");
-    int val = (int)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-    bool changed = ImGui::SliderInt(label, &val, v_min, v_max);
-    if (changed) {
-        lua_pushinteger(L, val);
-        lua_setfield(L, 2, "v");
-    }
-    lua_pushboolean(L, changed ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_InputText(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-    ImGuiInputTextFlags flags = (ImGuiInputTextFlags)luaL_optinteger(L, 3, 0);
-
-    lua_getfield(L, 2, "v");
-    const char *cur = lua_tostring(L, -1);
-    char buf[1024] = {0};
-    if (cur) strncpy(buf, cur, sizeof(buf) - 1);
-    lua_pop(L, 1);
-
-    bool changed = ImGui::InputText(label, buf, sizeof(buf), flags);
-    if (changed) {
-        lua_pushstring(L, buf);
-        lua_setfield(L, 2, "v");
-    }
-    lua_pushboolean(L, changed ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_CollapsingHeader(lua_State *L) {
-    const char *label = luaL_checkstring(L, 1);
-    ImGuiTreeNodeFlags flags = (ImGuiTreeNodeFlags)luaL_optinteger(L, 2, 0);
-    lua_pushboolean(L, ImGui::CollapsingHeader(label, flags) ? 1 : 0);
-    return 1;
-}
-
-static int l_imgui_Separator(lua_State *L) { ImGui::Separator(); return 0; }
-static int l_imgui_Spacing(lua_State *L) { ImGui::Spacing(); return 0; }
-static int l_imgui_SameLine(lua_State *L) {
-    ImGui::SameLine((float)luaL_optnumber(L, 1, 0.0), (float)luaL_optnumber(L, 2, -1.0));
-    return 0;
-}
-
-static int l_imgui_SetNextWindowSize(lua_State *L) {
-    float w = 300, h = 200;
-    if (lua_istable(L, 1)) {
-        lua_getfield(L, 1, "x"); w = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 1, "y"); h = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-    }
-    ImGuiCond cond = (ImGuiCond)luaL_optinteger(L, 2, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
-    return 0;
-}
-
-static int l_imgui_SetNextWindowPos(lua_State *L) {
-    float x = 100, y = 100;
-    if (lua_istable(L, 1)) {
-        lua_getfield(L, 1, "x"); x = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-        lua_getfield(L, 1, "y"); y = (float)lua_tonumber(L, -1); lua_pop(L, 1);
-    }
-    ImGuiCond cond = (ImGuiCond)luaL_optinteger(L, 2, ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
-    return 0;
-}
-
-static int l_imgui_OnFrame(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-
-    lua_newtable(L);
-    lua_pushvalue(L, 1);
-    lua_setfield(L, -2, "cond");
-    lua_pushvalue(L, 2);
-    lua_setfield(L, -2, "draw");
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    [[LoaderEngine shared].frameCallbackRefs addObject:@(ref)];
-    return 0;
-}
-
-static void RegisterImGuiModule(lua_State *L) {
-    lua_newtable(L);
-
-    lua_pushcfunction(L, l_imgui_Begin); lua_setfield(L, -2, "Begin");
-    lua_pushcfunction(L, l_imgui_End); lua_setfield(L, -2, "End");
-    lua_pushcfunction(L, l_imgui_BeginChild); lua_setfield(L, -2, "BeginChild");
-    lua_pushcfunction(L, l_imgui_EndChild); lua_setfield(L, -2, "EndChild");
-    lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "Text");
-    lua_pushcfunction(L, l_imgui_TextColored); lua_setfield(L, -2, "TextColored");
-    lua_pushcfunction(L, l_imgui_Button); lua_setfield(L, -2, "Button");
-    lua_pushcfunction(L, l_imgui_Checkbox); lua_setfield(L, -2, "Checkbox");
-    lua_pushcfunction(L, l_imgui_SliderFloat); lua_setfield(L, -2, "SliderFloat");
-    lua_pushcfunction(L, l_imgui_SliderInt); lua_setfield(L, -2, "SliderInt");
-    lua_pushcfunction(L, l_imgui_InputText); lua_setfield(L, -2, "InputText");
-    lua_pushcfunction(L, l_imgui_CollapsingHeader); lua_setfield(L, -2, "CollapsingHeader");
-    lua_pushcfunction(L, l_imgui_Separator); lua_setfield(L, -2, "Separator");
-    lua_pushcfunction(L, l_imgui_Spacing); lua_setfield(L, -2, "Spacing");
-    lua_pushcfunction(L, l_imgui_SameLine); lua_setfield(L, -2, "SameLine");
-    lua_pushcfunction(L, l_imgui_SetNextWindowSize); lua_setfield(L, -2, "SetNextWindowSize");
-    lua_pushcfunction(L, l_imgui_SetNextWindowPos); lua_setfield(L, -2, "SetNextWindowPos");
-    lua_pushcfunction(L, l_imgui_OnFrame); lua_setfield(L, -2, "OnFrame");
-
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "Process");
-
-    // Хелперы ImVec2, ImVec4, ImBool, ImFloat, ImInt, ImBuffer в Lua
-    const char *helpers = R"lua(
-        local M = ...
-        function M.ImVec2(x, y) return { x = x or 0, y = y or 0 } end
-        function M.ImVec4(x, y, z, w) return { x = x or 0, y = y or 0, z = z or 0, w = w or 1 } end
-        function M.ImBool(v) return { v = v and true or false } end
-        function M.ImFloat(v) return { v = tonumber(v) or 0.0 } end
-        function M.ImInt(v) return { v = math.floor(tonumber(v) or 0) } end
-        function M.ImBuffer(size) return { v = "", size = size or 256 } end
-        M.new = {
-            bool = M.ImBool,
-            float = M.ImFloat,
-            int = M.ImInt,
-            char = M.ImBuffer
-        }
-        M.Cond = { Always = 1, Once = 2, FirstUseEver = 4, Appearing = 8 }
-        M.WindowFlags = {
-            None = 0, NoTitleBar = 1, NoResize = 2, NoMove = 4,
-            NoScrollbar = 8, NoCollapse = 32, AlwaysAutoResize = 64,
-            NoBackground = 128, NoSavedSettings = 256, NoInputs = 197120
-        }
-    )lua";
-
-    if (luaL_loadstring(L, helpers) == LUA_OK) {
-        lua_pushvalue(L, -2);
-        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-            lua_pop(L, 1);
-        }
-    } else {
-        lua_pop(L, 1);
-    }
-
-    lua_pushvalue(L, -1);
-    lua_setglobal(L, "imgui");
-
-    lua_getglobal(L, "package");
-    lua_getfield(L, -1, "loaded");
-    lua_pushvalue(L, -3);
-    lua_setfield(L, -2, "imgui");
-    lua_pushvalue(L, -3);
-    lua_setfield(L, -2, "mimgui");
-    lua_pop(L, 3);
-}
-
-// ============================================================================
-// 7. Встроенный Metal + Dear ImGui Overlay View (HUD + Трейсеры + Меню)
-// ============================================================================
-@interface LoaderMetalOverlayView : MTKView <MTKViewDelegate>
-@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
-@property (nonatomic, assign) CGRect floatingBtnRect;
-@property (nonatomic, assign) BOOL draggingFloatingBtn;
-@property (nonatomic, assign) CGPoint dragStartTouch;
-@property (nonatomic, assign) CGPoint dragStartOrigin;
-@property (nonatomic, assign) BOOL movedDuringTouch;
-@end
-
-@implementation LoaderMetalOverlayView
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    self = [super initWithFrame:frame device:dev];
-    if (self) {
-        self.delegate = self;
-        self.commandQueue = [dev newCommandQueue];
-        self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-        self.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
-        self.opaque = NO;
-        self.backgroundColor = [UIColor clearColor];
-        self.framebufferOnly = NO;
-        self.preferredFramesPerSecond = 60;
-        self.multipleTouchEnabled = NO;
-
-        // Позиция плавающей кнопки "42" по умолчанию (левый верхний угол под челкой)
-        self.floatingBtnRect = CGRectMake(18.0, 62.0, 42.0, 42.0);
-
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO &io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
-
-        // Тёмно-фиолетовая минималистичная тема
-        ImGui::StyleColorsDark();
-        ImGuiStyle &style = ImGui::GetStyle();
-        style.WindowRounding = 10.0f;
-        style.FrameRounding = 6.0f;
-        style.GrabRounding = 6.0f;
-        style.TabRounding = 6.0f;
-        style.WindowBorderSize = 1.0f;
-        style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.07f, 0.12f, 0.94f);
-        style.Colors[ImGuiCol_Border] = ImVec4(0.55f, 0.32f, 0.92f, 0.45f);
-        style.Colors[ImGuiCol_TitleBg] = ImVec4(0.13f, 0.09f, 0.22f, 1.00f);
-        style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.32f, 0.18f, 0.56f, 1.00f);
-        style.Colors[ImGuiCol_Button] = ImVec4(0.36f, 0.20f, 0.62f, 0.85f);
-        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.48f, 0.28f, 0.78f, 1.00f);
-        style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.58f, 0.35f, 0.90f, 1.00f);
-        style.Colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.13f, 0.22f, 0.90f);
-        style.Colors[ImGuiCol_CheckMark] = ImVec4(0.72f, 0.45f, 1.00f, 1.00f);
-        style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.65f, 0.38f, 0.96f, 1.00f);
-        style.Colors[ImGuiCol_Tab] = ImVec4(0.18f, 0.13f, 0.28f, 0.90f);
-        style.Colors[ImGuiCol_TabHovered] = ImVec4(0.45f, 0.25f, 0.74f, 0.95f);
-        style.Colors[ImGuiCol_TabActive] = ImVec4(0.38f, 0.21f, 0.65f, 1.00f);
-
-        ImGui_ImplMetal_Init(dev);
-    }
-    return self;
-}
-
-// Сквозной hitTest: пропускаем все тапы в игру, если палец не попал по кнопке 42 или активному окну ImGui
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (g_showFloatingBtn && CGRectContainsPoint(CGRectInset(self.floatingBtnRect, -6, -6), point)) {
-        return self;
-    }
-
-    ImGuiContext *ctx = ImGui::GetCurrentContext();
-    if (ctx) {
-        for (int i = 0; i < ctx->Windows.Size; i++) {
-            ImGuiWindow *win = ctx->Windows[i];
-            if (!win || !win->Active || win->Hidden) continue;
-            if (win->Flags & ImGuiWindowFlags_NoInputs) continue;
-            CGRect r = CGRectMake(win->Pos.x, win->Pos.y, win->Size.x, win->Size.y);
-            if (CGRectContainsPoint(r, point)) {
-                return self;
-            }
-        }
-    }
-    return nil;
-}
-
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    UITouch *t = [touches anyObject];
-    if (!t) return;
-    CGPoint pt = [t locationInView:self];
-
-    if (g_showFloatingBtn && CGRectContainsPoint(CGRectInset(self.floatingBtnRect, -6, -6), pt)) {
-        self.draggingFloatingBtn = YES;
-        self.dragStartTouch = pt;
-        self.dragStartOrigin = self.floatingBtnRect.origin;
-        self.movedDuringTouch = NO;
-        return;
-    }
-
-    ImGuiIO &io = ImGui::GetIO();
-    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
-    io.AddMousePosEvent((float)pt.x, (float)pt.y);
-    io.AddMouseButtonEvent(0, true);
-}
-
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    UITouch *t = [touches anyObject];
-    if (!t) return;
-    CGPoint pt = [t locationInView:self];
-
-    if (self.draggingFloatingBtn) {
-        CGFloat dx = pt.x - self.dragStartTouch.x;
-        CGFloat dy = pt.y - self.dragStartTouch.y;
-        if (fabs(dx) > 5.0 || fabs(dy) > 5.0) self.movedDuringTouch = YES;
-        CGFloat nx = MAX(6.0, MIN(self.bounds.size.width - self.floatingBtnRect.size.width - 6.0, self.dragStartOrigin.x + dx));
-        CGFloat ny = MAX(24.0, MIN(self.bounds.size.height - self.floatingBtnRect.size.height - 6.0, self.dragStartOrigin.y + dy));
-        self.floatingBtnRect = CGRectMake(nx, ny, self.floatingBtnRect.size.width, self.floatingBtnRect.size.height);
-        return;
-    }
-
-    ImGuiIO &io = ImGui::GetIO();
-    io.AddMousePosEvent((float)pt.x, (float)pt.y);
-}
-
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    UITouch *t = [touches anyObject];
-    CGPoint pt = t ? [t locationInView:self] : CGPointZero;
-
-    if (self.draggingFloatingBtn) {
-        self.draggingFloatingBtn = NO;
-        if (!self.movedDuringTouch) {
-            g_showImGuiMenu = !g_showImGuiMenu;
-        }
-        return;
-    }
-
-    ImGuiIO &io = ImGui::GetIO();
-    io.AddMousePosEvent((float)pt.x, (float)pt.y);
-    io.AddMouseButtonEvent(0, false);
-}
-
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    self.draggingFloatingBtn = NO;
-    ImGuiIO &io = ImGui::GetIO();
-    io.AddMouseButtonEvent(0, false);
-}
-
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
-
-- (void)drawInMTKView:(MTKView *)view {
-    // Тикаем логику и рендер Lua
-    LoaderEngine *eng = [LoaderEngine shared];
-    [eng tickUpdate];
-    UpdateLoaderRamStats(eng.L);
-
-    MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
-    id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!rpd || !drawable) return;
-
-    id<MTLCommandBuffer> cmdBuf = [self.commandQueue commandBuffer];
-    ImGui_ImplMetal_NewFrame(rpd);
-
-    ImGuiIO &io = ImGui::GetIO();
-    CGFloat scale = self.contentScaleFactor > 0 ? self.contentScaleFactor : [UIScreen mainScreen].scale;
-    io.DisplaySize = ImVec2((float)self.bounds.size.width, (float)self.bounds.size.height);
-    io.DisplayFramebufferScale = ImVec2((float)scale, (float)scale);
-
-    ImGui::NewFrame();
-
-    // Выполняем Lua onRender / imgui.OnFrame
-    [eng tickRender];
-
-    ImDrawList *fg = ImGui::GetForegroundDrawList();
-    ImDrawList *bg = ImGui::GetBackgroundDrawList();
-    float sw = io.DisplaySize.x;
-    float sh = io.DisplaySize.y;
-
-    // ------------------------------------------------------------------------
-    // A. Отрисовка 2D-примитивов и Трейсеров
-    // ------------------------------------------------------------------------
-    if (g_renderEnabled) {
-        // 1) Прицел по центру экрана
-        if (g_drawCrosshair) {
-            ImVec2 c(sw * 0.5f, sh * 0.5f);
-            ImU32 col = Float4ToImU32(g_crosshairColor);
-            bg->AddLine(ImVec2(c.x - g_crosshairSize, c.y), ImVec2(c.x + g_crosshairSize, c.y), col, 1.5f);
-            bg->AddLine(ImVec2(c.x, c.y - g_crosshairSize), ImVec2(c.x, c.y + g_crosshairSize), col, 1.5f);
-            bg->AddCircle(c, g_crosshairSize * 0.55f, col, 20, 1.2f);
-        }
-
-        // 2) Демо-трейсеры (если включены в меню для проверки)
-        if (g_drawDemoTracers) {
-            float t = (float)ImGui::GetTime();
-            ImVec2 origin = g_tracerFromCenter ? ImVec2(sw * 0.5f, sh * 0.5f) : ImVec2(sw * 0.5f, sh - 12.0f);
-            ImU32 tCol = Float4ToImU32(g_tracerColor);
-            for (int i = 0; i < 3; i++) {
-                float angle = t * 1.1f + i * 2.094f;
-                ImVec2 target(sw * 0.5f + cosf(angle) * (sw * 0.25f),
-                              sh * 0.42f + sinf(angle) * (sh * 0.18f));
-                bg->AddLine(origin, target, tCol, g_tracerThickness);
-                bg->AddCircleFilled(target, 4.0f, tCol);
-                char tag[48];
-                snprintf(tag, sizeof(tag), "Target #%d [%.0fm]", i + 1, 25.0f + i * 18.0f);
-                bg->AddText(ImVec2(target.x + 7.0f, target.y - 7.0f), IM_COL32(255, 255, 255, 230), tag);
-            }
-        }
-
-        // 3) Пользовательские трейсеры из Lua (az.addTracer / az.addScreenTracer)
-        {
-            std::lock_guard<std::mutex> lock(g_renderMutex);
-            ImVec2 origin = g_tracerFromCenter ? ImVec2(sw * 0.5f, sh * 0.5f) : ImVec2(sw * 0.5f, sh - 10.0f);
-            for (const auto &kv : g_tracers) {
-                const TracerItem &tr = kv.second;
-                ImU32 col = ARGBToImU32(tr.color);
-                if (tr.is3D) {
-                    float sx = 0, sy = 0;
-                    if (ProjectWorldToScreen(tr.x1, tr.y1, tr.z1, sw, sh, sx, sy)) {
-                        ImVec2 dst(sx, sy);
-                        bg->AddLine(origin, dst, col, tr.thickness);
-                        bg->AddCircleFilled(dst, 3.8f, col);
-                        if (!tr.label.empty()) {
-                            bg->AddText(ImVec2(dst.x + 6.0f, dst.y - 7.0f), IM_COL32(255, 255, 255, 235), tr.label.c_str());
-                        }
-                    }
-                } else {
-                    ImVec2 p1(tr.x1, tr.y1);
-                    ImVec2 p2(tr.x2, tr.y2);
-                    bg->AddLine(p1, p2, col, tr.thickness);
-                    bg->AddCircleFilled(p2, 3.5f, col);
-                    if (!tr.label.empty()) {
-                        bg->AddText(ImVec2(p2.x + 6.0f, p2.y - 7.0f), IM_COL32(255, 255, 255, 235), tr.label.c_str());
-                    }
-                }
-            }
-
-            // 4) Очередь 2D-примитивов из Lua (renderDrawLine/Box/Circle/Text)
-            for (const auto &c : g_luaDrawQueue) {
-                ImU32 col = ARGBToImU32(c.color);
-                switch (c.type) {
-                    case DrawCmdType::Line:
-                        bg->AddLine(ImVec2(c.x1, c.y1), ImVec2(c.x2, c.y2), col, c.radius);
-                        break;
-                    case DrawCmdType::Box:
-                        bg->AddRect(ImVec2(c.x1, c.y1), ImVec2(c.x1 + c.x2, c.y1 + c.y2), col, 0.0f, 0, c.radius > 0 ? c.radius : 1.0f);
-                        break;
-                    case DrawCmdType::BoxFilled:
-                        bg->AddRectFilled(ImVec2(c.x1, c.y1), ImVec2(c.x1 + c.x2, c.y1 + c.y2), col);
-                        break;
-                    case DrawCmdType::Circle:
-                        bg->AddCircle(ImVec2(c.x1, c.y1), c.radius, col, c.segments, 1.5f);
-                        break;
-                    case DrawCmdType::CircleFilled:
-                        bg->AddCircleFilled(ImVec2(c.x1, c.y1), c.radius, col, c.segments);
-                        break;
-                    case DrawCmdType::Text:
-                        bg->AddText(ImVec2(c.x1, c.y1), col, c.text.c_str());
-                        break;
-                }
-            }
-            g_luaDrawQueue.clear();
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // B. Маленький текст СПРАВА ПО СЕРЕДИНЕ: сколько RAM жрёт именно лоадер
-    // ------------------------------------------------------------------------
-    if (g_showRamHud && sw > 0 && sh > 0) {
-        char ramText[96];
-        double totalMB = (double)g_ramStats.totalBytes / (1024.0 * 1024.0);
-        double luaKB = (double)g_ramStats.luaHeapBytes / 1024.0;
-        snprintf(ramText, sizeof(ramText), "Loader RAM: %.2f MB (Lua: %.0f KB)", totalMB, luaKB);
-
-        const float fontSize = 11.0f;
-        ImFont *font = ImGui::GetFont();
-        ImVec2 txtSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, ramText);
-
-        float posX = sw - txtSize.x - 10.0f;
-        float posY = (sh - txtSize.y) * 0.5f;
-
-        // Чёткая тень/обводка, чтобы мелкий текст легко читался на любом фоне в игре
-        ImU32 shadowCol = IM_COL32(0, 0, 0, 210);
-        ImU32 textCol = IM_COL32(228, 218, 255, 225);
-        fg->AddText(font, fontSize, ImVec2(posX + 1.0f, posY + 1.0f), shadowCol, ramText);
-        fg->AddText(font, fontSize, ImVec2(posX - 1.0f, posY), shadowCol, ramText);
-        fg->AddText(font, fontSize, ImVec2(posX, posY), textCol, ramText);
-    }
-
-    // ------------------------------------------------------------------------
-    // C. Плавающая круглая кнопка "42" для быстрого открытия ImGui меню
-    // ------------------------------------------------------------------------
-    if (g_showFloatingBtn) {
-        ImVec2 center((float)CGRectGetMidX(self.floatingBtnRect), (float)CGRectGetMidY(self.floatingBtnRect));
-        float r = (float)self.floatingBtnRect.size.width * 0.5f;
-        fg->AddCircleFilled(center, r, IM_COL32(24, 18, 38, 220), 32);
-        fg->AddCircle(center, r, g_showImGuiMenu ? IM_COL32(180, 110, 255, 255) : IM_COL32(130, 80, 220, 190), 32, 1.8f);
-        ImVec2 labelSz = ImGui::CalcTextSize("42");
-        fg->AddText(ImVec2(center.x - labelSz.x * 0.5f, center.y - labelSz.y * 0.5f),
-                    IM_COL32(245, 240, 255, 245), "42");
-    }
-
-    // ------------------------------------------------------------------------
-    // D. Главное окно ImGui интерфейса (Scripts / Render & Tracers / Console / Settings)
-    // ------------------------------------------------------------------------
-    if (g_showImGuiMenu) {
-        ImGui::SetNextWindowSize(ImVec2(460.0f, 320.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowPos(ImVec2((sw - 460.0f) * 0.5f, (sh - 320.0f) * 0.5f), ImGuiCond_FirstUseEver);
-
-        if (ImGui::Begin("Arizona 42Loader  |  Lua 5.4 + ImGui", &g_showImGuiMenu, ImGuiWindowFlags_NoCollapse)) {
-            if (ImGui::BeginTabBar("LoaderTabs")) {
-                // --- Вкладка 1: Скрипты ---
-                if (ImGui::BeginTabItem("Scripts")) {
-                    if (ImGui::Button("Reload All Scripts")) {
-                        [eng reloadAllScripts];
-                    }
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("Dir: Documents/lua_loader/scripts");
-                    ImGui::Separator();
-
-                    auto scripts = [eng allScriptsStatus];
-                    if (scripts.empty()) {
-                        ImGui::TextWrapped("No .lua scripts found in Documents/lua_loader/scripts/");
-                    } else {
-                        ImGui::BeginChild("ScriptsScroll", ImVec2(0, 0), false);
-                        for (size_t i = 0; i < scripts.size(); i++) {
-                            auto &sc = scripts[i];
-                            ImGui::PushID((int)i);
-                            bool en = sc.enabled;
-                            if (ImGui::Checkbox("##en", &en)) {
-                                [eng setScript:SafeNSString(sc.filename.c_str()) enabled:en];
-                            }
-                            ImGui::SameLine();
-                            ImGui::Text("%s", sc.filename.c_str());
-                            ImGui::SameLine();
-                            if (sc.loaded) {
-                                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "[ACTIVE]");
-                            } else if (!sc.enabled) {
-                                ImGui::TextDisabled("[DISABLED]");
-                            } else {
-                                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "[ERROR]");
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::SmallButton("Reload")) {
-                                [eng loadSingleScript:SafeNSString(sc.filename.c_str())];
-                            }
-                            if (!sc.lastError.empty()) {
-                                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "  %s", sc.lastError.c_str());
-                            }
-                            ImGui::PopID();
-                        }
-                        ImGui::EndChild();
-                    }
-                    ImGui::EndTabItem();
-                }
-
-                // --- Вкладка 2: Render & Tracers ---
-                if (ImGui::BeginTabItem("Render & Tracers")) {
-                    ImGui::Checkbox("Enable Render & Tracers", &g_renderEnabled);
-                    ImGui::Separator();
-
-                    ImGui::Checkbox("Demo / Test Tracers (Preview)", &g_drawDemoTracers);
-                    ImGui::Checkbox("Origin: Screen Center (off = Bottom)", &g_tracerFromCenter);
-                    ImGui::SliderFloat("Tracer Thickness", &g_tracerThickness, 0.8f, 5.0f, "%.1f px");
-                    ImGui::ColorEdit4("Tracer Color", g_tracerColor);
-
-                    ImGui::Separator();
-                    ImGui::Checkbox("Center Crosshair", &g_drawCrosshair);
-                    if (g_drawCrosshair) {
-                        ImGui::SliderFloat("Crosshair Size", &g_crosshairSize, 3.0f, 25.0f, "%.0f px");
-                        ImGui::ColorEdit4("Crosshair Color", g_crosshairColor);
-                    }
-
-                    ImGui::Separator();
-                    size_t activeCount = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(g_renderMutex);
-                        activeCount = g_tracers.size();
-                    }
-                    ImGui::Text("Active Lua Tracers: %zu", activeCount);
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Clear Tracers")) {
-                        std::lock_guard<std::mutex> lock(g_renderMutex);
-                        g_tracers.clear();
-                    }
-                    ImGui::EndTabItem();
-                }
-
-                // --- Вкладка 3: Console & Lua Exec ---
-                if (ImGui::BeginTabItem("Console")) {
-                    static char luaCmdBuf[512] = "";
-                    ImGui::SetNextItemWidth(-70.0f);
-                    bool enterPressed = ImGui::InputText("##luacmd", luaCmdBuf, sizeof(luaCmdBuf), ImGuiInputTextFlags_EnterReturnsTrue);
-                    ImGui::SameLine();
-                    if (ImGui::Button("Run", ImVec2(60.0f, 0)) || enterPressed) {
-                        if (strlen(luaCmdBuf) > 0) {
-                            [eng executeLuaString:SafeNSString(luaCmdBuf)];
-                            luaCmdBuf[0] = '\0';
-                        }
-                    }
-                    ImGui::Separator();
-
-                    ImGui::BeginChild("ConsoleScroll", ImVec2(0, 0), true);
-                    {
-                        std::lock_guard<std::mutex> lock(g_logMutex);
-                        for (const auto &line : g_consoleLogs) {
-                            ImGui::TextUnformatted(line.c_str());
-                        }
-                    }
-                    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f) {
-                        ImGui::SetScrollHereY(1.0f);
-                    }
-                    ImGui::EndChild();
-                    ImGui::EndTabItem();
-                }
-
-                // --- Вкладка 4: Settings & RAM Breakdown ---
-                if (ImGui::BeginTabItem("Settings")) {
-                    ImGui::Checkbox("Show Loader RAM HUD (Right-Middle)", &g_showRamHud);
-                    ImGui::Checkbox("Show Floating '42' Button", &g_showFloatingBtn);
-                    ImGui::Separator();
-
-                    ImGui::Text("Loader Memory Footprint:");
-                    ImGui::BulletText("Total Loader RAM: %.2f MB", (double)g_ramStats.totalBytes / (1024.0 * 1024.0));
-                    ImGui::BulletText("Lua 5.4 VM Heap:  %.1f KB", (double)g_ramStats.luaHeapBytes / 1024.0);
-                    ImGui::BulletText("Mach-O Image:     %.2f MB", (double)g_ramStats.dylibImageBytes / (1024.0 * 1024.0));
-                    ImGui::BulletText("ImGui & Buffers:  %.1f KB", (double)g_ramStats.buffersBytes / 1024.0);
-
-                    ImGui::Separator();
-                    if (ImGui::Button("Trigger Lua GC")) {
-                        std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-                        if (eng.L) lua_gc(eng.L, LUA_GCCOLLECT, 0);
-                        g_lastRamUpdate = 0;
-                        UpdateLoaderRamStats(eng.L);
-                    }
-                    ImGui::EndTabItem();
-                }
-
-                ImGui::EndTabBar();
-            }
-        }
-        ImGui::End();
-    }
-
-    ImGui::Render();
-    ImDrawData *drawData = ImGui::GetDrawData();
-
-    id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
-    ImGui_ImplMetal_RenderDrawData(drawData, cmdBuf, enc);
-    [enc endEncoding];
-
-    [cmdBuf presentDrawable:drawable];
-    [cmdBuf commit];
-}
-
-@end
-
-// ============================================================================
-// 8. Реализация LoaderEngine
-// ============================================================================
-@implementation LoaderEngine {
-    std::vector<ScriptEntry> _scripts;
-    LoaderMetalOverlayView *_overlayView;
-}
-
-+ (instancetype)shared {
-    static LoaderEngine *instance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[LoaderEngine alloc] init];
-    });
-    return instance;
-}
-
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _commandRefs = [NSMutableDictionary dictionary];
-        _frameCallbackRefs = [NSMutableArray array];
-        _disabledScripts = [NSMutableDictionary dictionary];
-        _currentDialogId = -1;
-        _chatInputText = @"";
-
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        _baseDir = [docs stringByAppendingPathComponent:@"lua_loader"];
-        _scriptsDir = [_baseDir stringByAppendingPathComponent:@"scripts"];
-        _configDir = [_baseDir stringByAppendingPathComponent:@"config"];
-        _libDir = [_baseDir stringByAppendingPathComponent:@"lib"];
-    }
-    return self;
-}
-
-- (void)ensureDirectories {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *dir in @[self.baseDir, self.scriptsDir, self.configDir, self.libDir]) {
+static void EnsureDirectories() {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    std::string base = GetBaseDir();
+    NSArray* subdirs = @[
+        [NSString stringWithUTF8String:base.c_str()],
+        [NSString stringWithUTF8String:(base + "/scripts").c_str()],
+        [NSString stringWithUTF8String:(base + "/config").c_str()],
+        [NSString stringWithUTF8String:(base + "/lib").c_str()]
+    ];
+    for (NSString* dir in subdirs) {
         if (![fm fileExistsAtPath:dir]) {
             [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         }
     }
 }
 
-- (void)loadConfig {
-    NSString *cfgPath = [self.configDir stringByAppendingPathComponent:@"loader_config.json"];
-    NSData *data = [NSData dataWithContentsOfFile:cfgPath];
-    if (!data) return;
-    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![dict isKindOfClass:[NSDictionary class]]) return;
-
-    NSDictionary *disabled = dict[@"disabledScripts"];
-    if ([disabled isKindOfClass:[NSDictionary class]]) {
-        [self.disabledScripts setDictionary:disabled];
-    }
-    if (dict[@"showRamHud"]) g_showRamHud = [dict[@"showRamHud"] boolValue];
-    if (dict[@"showFloatingBtn"]) g_showFloatingBtn = [dict[@"showFloatingBtn"] boolValue];
-    if (dict[@"renderEnabled"]) g_renderEnabled = [dict[@"renderEnabled"] boolValue];
-}
-
-- (void)saveConfig {
-    NSString *cfgPath = [self.configDir stringByAppendingPathComponent:@"loader_config.json"];
-    NSDictionary *dict = @{
-        @"disabledScripts": self.disabledScripts ?: @{},
-        @"showRamHud": @(g_showRamHud),
-        @"showFloatingBtn": @(g_showFloatingBtn),
-        @"renderEnabled": @(g_renderEnabled)
-    };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:NSJSONWritingPrettyPrinted error:nil];
-    if (data) [data writeToFile:cfgPath atomically:YES];
-}
-
-- (void)setupLuaState {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-
-    if (_L) {
-        lua_close(_L);
-        _L = nullptr;
-    }
-    g_luaThreads.clear();
-    [self.commandRefs removeAllObjects];
-    [self.frameCallbackRefs removeAllObjects];
-
-    _L = luaL_newstate();
-    luaL_openlibs(_L);
-
-    // Настройка package.path под Documents/lua_loader/lib/?.lua и scripts/?.lua
-    NSString *pkgPath = [NSString stringWithFormat:@"%@/?.lua;%@/?.lua", self.libDir, self.scriptsDir];
-    lua_getglobal(_L, "package");
-    lua_pushstring(_L, [pkgPath UTF8String]);
-    lua_setfield(_L, -2, "path");
-    lua_pop(_L, 1);
-
-    // Глобальные функции
-    lua_pushcfunction(_L, l_print); lua_setglobal(_L, "print");
-    lua_pushcfunction(_L, l_wait); lua_setglobal(_L, "wait");
-    lua_pushcfunction(_L, l_asyncHttpRequest); lua_setglobal(_L, "asyncHttpRequest");
-
-    // lua_thread таблица
-    lua_newtable(_L);
-    lua_pushcfunction(_L, l_lua_thread_create);
-    lua_setfield(_L, -2, "create");
-    lua_setglobal(_L, "lua_thread");
-
-    // SA-MP / MoonLoader API
-    lua_pushcfunction(_L, l_sampAddChatMessage); lua_setglobal(_L, "sampAddChatMessage");
-    lua_pushcfunction(_L, l_sampSendChat); lua_setglobal(_L, "sampSendChat");
-    lua_pushcfunction(_L, l_sampRegisterChatCommand); lua_setglobal(_L, "sampRegisterChatCommand");
-    lua_pushcfunction(_L, l_sampUnregisterChatCommand); lua_setglobal(_L, "sampUnregisterChatCommand");
-    lua_pushcfunction(_L, l_sampShowDialog); lua_setglobal(_L, "sampShowDialog");
-    lua_pushcfunction(_L, l_sampGetCurrentDialogId); lua_setglobal(_L, "sampGetCurrentDialogId");
-    lua_pushcfunction(_L, l_sampIsDialogActive); lua_setglobal(_L, "sampIsDialogActive");
-    lua_pushcfunction(_L, l_sampIsChatInputActive); lua_setglobal(_L, "sampIsChatInputActive");
-    lua_pushcfunction(_L, l_sampGetChatInputText); lua_setglobal(_L, "sampGetChatInputText");
-    lua_pushcfunction(_L, l_isSampAvailable); lua_setglobal(_L, "isSampAvailable");
-    lua_pushcfunction(_L, l_sampGetGamestate); lua_setglobal(_L, "sampGetGamestate");
-
-    // Render & 3D->2D API
-    lua_pushcfunction(_L, l_getScreenResolution); lua_setglobal(_L, "getScreenResolution");
-    lua_pushcfunction(_L, l_convert3DCoordsToScreen); lua_setglobal(_L, "convert3DCoordsToScreen");
-    lua_pushcfunction(_L, l_renderDrawLine); lua_setglobal(_L, "renderDrawLine");
-    lua_pushcfunction(_L, l_renderDrawBox); lua_setglobal(_L, "renderDrawBox");
-    lua_pushcfunction(_L, l_renderDrawCircle); lua_setglobal(_L, "renderDrawCircle");
-    lua_pushcfunction(_L, l_renderDrawText); lua_setglobal(_L, "renderDrawText");
-
-    // az.* namespace
-    lua_newtable(_L);
-    lua_pushcfunction(_L, l_sampAddChatMessage); lua_setfield(_L, -2, "chat");
-    lua_pushcfunction(_L, l_sampSendChat); lua_setfield(_L, -2, "send");
-    lua_pushcfunction(_L, l_az_notify); lua_setfield(_L, -2, "notify");
-    lua_pushcfunction(_L, l_az_vibrate); lua_setfield(_L, -2, "vibrate");
-    lua_pushcfunction(_L, l_az_setClipboard); lua_setfield(_L, -2, "setClipboard");
-    lua_pushcfunction(_L, l_az_getClipboard); lua_setfield(_L, -2, "getClipboard");
-    lua_pushcfunction(_L, l_az_openURL); lua_setfield(_L, -2, "openURL");
-    lua_pushcfunction(_L, l_az_getLoaderRAM); lua_setfield(_L, -2, "getLoaderRAM");
-    lua_pushcfunction(_L, l_az_setCamera); lua_setfield(_L, -2, "setCamera");
-    lua_pushcfunction(_L, l_az_addTracer); lua_setfield(_L, -2, "addTracer");
-    lua_pushcfunction(_L, l_az_addScreenTracer); lua_setfield(_L, -2, "addScreenTracer");
-    lua_pushcfunction(_L, l_az_removeTracer); lua_setfield(_L, -2, "removeTracer");
-    lua_pushcfunction(_L, l_az_clearTracers); lua_setfield(_L, -2, "clearTracers");
-    lua_setglobal(_L, "az");
-
-    // Dear ImGui Lua bindings
-    RegisterImGuiModule(_L);
-
-    // Встроенные модули json и inicfg
-    const char *builtinLibs = R"lua(
-        json = {}
-        function json.encode(val)
-            local t = type(val)
-            if t == "nil" then return "null"
-            elseif t == "boolean" then return val and "true" or "false"
-            elseif t == "number" then return tostring(val)
-            elseif t == "string" then
-                return string.format("%q", val):gsub("\n", "\\n")
-            elseif t == "table" then
-                local isArr = (#val > 0)
-                local parts = {}
-                if isArr then
-                    for i = 1, #val do parts[#parts + 1] = json.encode(val[i]) end
-                    return "[" .. table.concat(parts, ",") .. "]"
-                else
-                    for k, v in pairs(val) do
-                        parts[#parts + 1] = json.encode(tostring(k)) .. ":" .. json.encode(v)
-                    end
-                    return "{" .. table.concat(parts, ",") .. "}"
-                end
-            end
-            return "null"
-        end
-        package.loaded["json"] = json
-
-        inicfg = {}
-        function inicfg.load(defaultTbl, filename)
-            local res = {}
-            if type(defaultTbl) == "table" then
-                for sec, kv in pairs(defaultTbl) do
-                    res[sec] = {}
-                    for k, v in pairs(kv) do res[sec][k] = v end
-                end
-            end
-            local f = io.open(filename, "r")
-            if not f then return res end
-            local curSec = "main"
-            for line in f:lines() do
-                local s = line:match("^%s*%[([^%]]+)%]%s*$")
-                if s then
-                    curSec = s
-                    res[curSec] = res[curSec] or {}
-                else
-                    local k, v = line:match("^%s*([^=;#]+)%s*=%s*(.-)%s*$")
-                    if k and v then
-                        res[curSec] = res[curSec] or {}
-                        if v == "true" then v = true
-                        elseif v == "false" then v = false
-                        elseif tonumber(v) then v = tonumber(v) end
-                        res[curSec][k] = v
-                    end
-                end
-            end
-            f:close()
-            return res
-        end
-        function inicfg.save(data, filename)
-            local f = io.open(filename, "w")
-            if not f then return false end
-            for sec, kv in pairs(data) do
-                f:write("[" .. tostring(sec) .. "]\n")
-                for k, v in pairs(kv) do
-                    f:write(tostring(k) .. "=" .. tostring(v) .. "\n")
-                end
-                f:write("\n")
-            end
-            f:close()
-            return true
-        end
-        package.loaded["inicfg"] = inicfg
-    )lua";
-
-    if (luaL_dostring(_L, builtinLibs) != LUA_OK) {
-        AppendConsoleLog(std::string("[builtinLibs err] ") + (lua_tostring(_L, -1) ?: ""));
-        lua_pop(_L, 1);
-    }
-}
-
-- (void)reloadAllScripts {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    [self ensureDirectories];
-    [self setupLuaState];
-    _scripts.clear();
-
-    NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self.scriptsDir error:nil];
-    NSArray<NSString *> *sorted = [files sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-
-    for (NSString *file in sorted) {
-        if (![[file pathExtension].lowercaseString isEqualToString:@"lua"]) continue;
-        ScriptEntry entry;
-        entry.filename = [file UTF8String];
-        entry.fullPath = [[self.scriptsDir stringByAppendingPathComponent:file] UTF8String];
-        entry.enabled = ![self.disabledScripts[file] boolValue];
-        entry.loaded = false;
-        _scripts.push_back(entry);
-
-        if (entry.enabled) {
-            [self loadSingleScript:file];
+static LuaScriptInstance* FindScriptByState(lua_State* L) {
+    for (auto* s : g_Scripts) {
+        if (s->L == L) return s;
+        for (auto& t : s->threads) {
+            if (t.co == L) return s;
         }
     }
-    AppendConsoleLog("Scripts reloaded (" + std::to_string(_scripts.size()) + " found)");
-}
-
-- (BOOL)loadSingleScript:(NSString *)filename {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return NO;
-
-    NSString *path = [self.scriptsDir stringByAppendingPathComponent:filename];
-    std::string fnameStr = [filename UTF8String];
-
-    int top = lua_gettop(_L);
-    int status = luaL_loadfile(_L, [path UTF8String]);
-    if (status == LUA_OK) {
-        status = lua_pcall(_L, 0, 0, 0);
-    }
-
-    BOOL ok = (status == LUA_OK);
-    std::string errMsg;
-    if (!ok) {
-        const char *e = lua_tostring(_L, -1);
-        errMsg = e ? e : "Unknown Lua error";
-        AppendConsoleLog("[Script Error] " + fnameStr + ": " + errMsg);
-    } else {
-        AppendConsoleLog("[Loaded] " + fnameStr);
-    }
-    lua_settop(_L, top);
-
-    for (auto &sc : _scripts) {
-        if (sc.filename == fnameStr) {
-            sc.loaded = ok;
-            sc.lastError = ok ? "" : errMsg;
-            break;
-        }
-    }
-    return ok;
-}
-
-- (void)setScript:(NSString *)filename enabled:(BOOL)enabled {
-    if (enabled) {
-        [self.disabledScripts removeObjectForKey:filename];
-    } else {
-        self.disabledScripts[filename] = @YES;
-    }
-    [self saveConfig];
-    [self reloadAllScripts];
-}
-
-- (std::vector<ScriptEntry>)allScriptsStatus {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    return _scripts;
-}
-
-- (void)executeLuaString:(NSString *)code {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L || !code) return;
-    AppendConsoleLog(std::string("> ") + [code UTF8String]);
-    int top = lua_gettop(_L);
-    if (luaL_dostring(_L, [code UTF8String]) != LUA_OK) {
-        const char *e = lua_tostring(_L, -1);
-        AppendConsoleLog(std::string("[Exec Error] ") + (e ? e : "error"));
-    }
-    lua_settop(_L, top);
+    return nullptr;
 }
 
 // ============================================================================
-// 9. Тики, события, хуки и вызовы Lua коллбэков (без утечек стека!)
+// 4. OUTGOING CHAT & COMMAND INTERCEPTION (CORE FEATURE)
 // ============================================================================
-- (void)tickUpdate {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return;
 
-    double now = CACurrentMediaTime();
+static void SendRawToGameChat(const std::string& utf8Text) {
+    std::string cpText = Utf8ToCp1251(utf8Text);
 
-    // 1. Планировщик lua_thread корутин
-    for (size_t i = 0; i < g_luaThreads.size(); ) {
-        LuaThreadTask &t = g_luaThreads[i];
-        if (t.finished || !t.co) {
-            if (t.threadRef != LUA_NOREF) luaL_unref(_L, LUA_REGISTRYINDEX, t.threadRef);
-            g_luaThreads.erase(g_luaThreads.begin() + i);
-            continue;
-        }
-        if (now >= t.wakeTime) {
-            int nres = 0;
-            int st = lua_resume(t.co, _L, 0, &nres);
-            if (st == LUA_OK) {
-                t.finished = true;
-                luaL_unref(_L, LUA_REGISTRYINDEX, t.threadRef);
-                g_luaThreads.erase(g_luaThreads.begin() + i);
-                continue;
-            } else if (st == LUA_YIELD) {
-                if (nres > 0) lua_pop(t.co, nres);
-            } else {
-                const char *err = lua_tostring(t.co, -1);
-                AppendConsoleLog(std::string("[Thread Error] ") + (err ? err : "unknown"));
-                luaL_unref(_L, LUA_REGISTRYINDEX, t.threadRef);
-                g_luaThreads.erase(g_luaThreads.begin() + i);
-                continue;
-            }
-        }
-        i++;
+    // 1. Try native C++ CNetGame::SendCommand / SendChat if captured
+    if (!cpText.empty() && cpText[0] == '/' && orig_SendCommand && g_LastNetGamePtr) {
+        orig_SendCommand(g_LastNetGamePtr, cpText.c_str());
+        return;
+    }
+    if (orig_SendChat && g_LastNetGamePtr) {
+        orig_SendChat(g_LastNetGamePtr, cpText.c_str());
+        return;
     }
 
-    // 2. Глобальный коллбэк onUpdate()
-    int top = lua_gettop(_L);
-    lua_getglobal(_L, "onUpdate");
-    if (lua_isfunction(_L, -1)) {
-        if (lua_pcall(_L, 0, 0, 0) != LUA_OK) {
-            const char *err = lua_tostring(_L, -1);
-            AppendConsoleLog(std::string("[onUpdate Error] ") + (err ? err : "unknown"));
-        }
+    // 2. Fallback: find symbol dynamically via dlsym
+    static Fn_SendCommand dynSendCmd = (Fn_SendCommand)dlsym(RTLD_DEFAULT, "_ZN4CNetGame11SendCommandEPKc");
+    static Fn_SendChat dynSendChat = (Fn_SendChat)dlsym(RTLD_DEFAULT, "_ZN4CNetGame8SendChatEPKc");
+    if (!cpText.empty() && cpText[0] == '/' && dynSendCmd && g_LastNetGamePtr) {
+        dynSendCmd(g_LastNetGamePtr, cpText.c_str());
+        return;
     }
-    lua_settop(_L, top);
+    if (dynSendChat && g_LastNetGamePtr) {
+        dynSendChat(g_LastNetGamePtr, cpText.c_str());
+        return;
+    }
+
+    LogConsole("[ChatOut -> Server] " + utf8Text);
 }
 
-- (void)tickRender {
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return;
+// Returns TRUE if the input matched a registered Lua script command and was consumed!
+static bool TryExecuteChatCommand(const std::string& rawInput) {
+    std::string utf8 = Cp1251ToUtf8(rawInput);
+    // Trim leading whitespace
+    size_t start = utf8.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return false;
+    utf8 = utf8.substr(start);
 
-    int top = lua_gettop(_L);
-
-    // 1. Классический onRender / onDrawFrame
-    for (const char *cbName : {"onRender", "onDrawFrame"}) {
-        lua_getglobal(_L, cbName);
-        if (lua_isfunction(_L, -1)) {
-            if (lua_pcall(_L, 0, 0, 0) != LUA_OK) {
-                const char *err = lua_tostring(_L, -1);
-                AppendConsoleLog(std::string("[") + cbName + " Error] " + (err ? err : "unknown"));
-            }
-        }
-        lua_settop(_L, top);
+    if (utf8.empty() || utf8[0] != '/') {
+        return false;
     }
 
-    // 2. mimgui-стиль: imgui.OnFrame(condFn, drawFn)
-    for (NSNumber *refNum in self.frameCallbackRefs) {
-        int ref = [refNum intValue];
-        lua_rawgeti(_L, LUA_REGISTRYINDEX, ref);
-        if (lua_istable(_L, -1)) {
-            lua_getfield(_L, -1, "cond");
-            bool shouldDraw = false;
-            if (lua_isfunction(_L, -1)) {
-                if (lua_pcall(_L, 0, 1, 0) == LUA_OK) {
-                    shouldDraw = lua_toboolean(_L, -1);
-                }
-            }
-            lua_settop(_L, top + 1); // оставляем только таблицу фрейма на стеке
+    // Deduplicate if both UIKit UITextField and JNI OnInputEnd fire for the same submit
+    uint64_t now = NowMs();
+    if (utf8 == g_LastInterceptedCmd && (now - g_LastInterceptedMs) < 250) {
+        return true; // Already executed, still block server send!
+    }
 
-            if (shouldDraw) {
-                lua_getfield(_L, -1, "draw");
-                if (lua_isfunction(_L, -1)) {
-                    if (lua_pcall(_L, 0, 0, 0) != LUA_OK) {
-                        const char *err = lua_tostring(_L, -1);
-                        AppendConsoleLog(std::string("[imgui.OnFrame Error] ") + (err ? err : "unknown"));
+    std::string withoutSlash = utf8.substr(1);
+    std::string cmdName;
+    std::string cmdArgs;
+
+    size_t spacePos = withoutSlash.find(' ');
+    if (spacePos == std::string::npos) {
+        cmdName = withoutSlash;
+        cmdArgs = "";
+    } else {
+        cmdName = withoutSlash.substr(0, spacePos);
+        size_t argStart = withoutSlash.find_first_not_of(' ', spacePos);
+        cmdArgs = (argStart != std::string::npos) ? withoutSlash.substr(argStart) : "";
+    }
+
+    std::string key = ToLowerASCII(cmdName);
+    if (key.empty()) return false;
+
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    auto it = g_ChatCommands.find(key);
+    if (it == g_ChatCommands.end()) {
+        return false; // Not our script command -> let SA-MP server handle it
+    }
+
+    g_LastInterceptedCmd = utf8;
+    g_LastInterceptedMs = now;
+
+    RegisteredCommand reg = it->second;
+    if (reg.L && reg.funcRef != LUA_NOREF) {
+        lua_State* L = reg.L;
+        lua_rawgeti(L, LUA_REGISTRYINDEX, reg.funcRef);
+        lua_pushstring(L, cmdArgs.c_str());
+        if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+            const char* err = lua_tostring(L, -1);
+            std::string errMsg = err ? err : "unknown command error";
+            LogConsole("[CMD /" + key + " ERROR] " + errMsg);
+            LuaScriptInstance* inst = FindScriptByState(L);
+            if (inst) {
+                inst->hasError = true;
+                inst->lastError = errMsg;
+            }
+            lua_pop(L, 1);
+        }
+    }
+    return true;
+}
+
+// Hooked JNI OnInputEnd (called when iOS keyboard sends chat text to GTASA/Arizona)
+static void hooked_OnInputEnd(JNIEnv* env, jobject thiz, jbyteArray array) {
+    g_LastJNIEnv = env;
+    g_LastJObject = thiz;
+
+    if (env && array) {
+        // Standard JNIEnv function table indices: GetArrayLength = 171, GetByteArrayElements = 184, ReleaseByteArrayElements = 192
+        void** vtable = *reinterpret_cast<void***>(env);
+        typedef int (*Fn_GetArrayLength)(JNIEnv*, jbyteArray);
+        typedef int8_t* (*Fn_GetByteArrayElements)(JNIEnv*, jbyteArray, uint8_t*);
+        typedef void (*Fn_ReleaseByteArrayElements)(JNIEnv*, jbyteArray, int8_t*, int);
+
+        auto getLen = reinterpret_cast<Fn_GetArrayLength>(vtable[171]);
+        auto getBytes = reinterpret_cast<Fn_GetByteArrayElements>(vtable[184]);
+        auto relBytes = reinterpret_cast<Fn_ReleaseByteArrayElements>(vtable[192]);
+
+        if (getLen && getBytes && relBytes) {
+            int len = getLen(env, array);
+            if (len > 0 && len < 4096) {
+                int8_t* ptr = getBytes(env, array, nullptr);
+                if (ptr) {
+                    std::string text(reinterpret_cast<const char*>(ptr), len);
+                    relBytes(env, array, ptr, 2); // JNI_ABORT
+
+                    if (TryExecuteChatCommand(text)) {
+                        return; // Consumed by Lua script! Do NOT pass to server.
                     }
                 }
             }
         }
-        lua_settop(_L, top);
+    }
+
+    if (orig_OnInputEnd) {
+        orig_OnInputEnd(env, thiz, array);
     }
 }
 
-// Исправленный метод без capture autoreleasing outText и без утечек стека Lua
-- (BOOL)dispatchServerMessage:(uint32_t)color text:(NSString *)text outColor:(uint32_t *)outColor outText:(NSString **)outText {
-    _inGameSession = YES;
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return YES;
+static void hooked_SendCommand(void* thisPtr, const char* cmd) {
+    g_LastNetGamePtr = thisPtr;
+    if (cmd && TryExecuteChatCommand(cmd)) {
+        return; // Consumed by Lua script!
+    }
+    if (orig_SendCommand) {
+        orig_SendCommand(thisPtr, cmd);
+    }
+}
 
-    __block BOOL allow = YES;
-    __block uint32_t modColor = color;
-    __block BOOL hasModColor = NO;
-    __block NSString *modText = nil;
+static void hooked_SendChat(void* thisPtr, const char* msg) {
+    g_LastNetGamePtr = thisPtr;
+    if (msg && TryExecuteChatCommand(msg)) {
+        return; // Consumed by Lua script!
+    }
+    if (orig_SendChat) {
+        orig_SendChat(thisPtr, msg);
+    }
+}
 
-    int top = lua_gettop(_L);
-    lua_getglobal(_L, "onServerMessage");
-    if (lua_isfunction(_L, -1)) {
-        lua_pushinteger(_L, (lua_Integer)color);
-        lua_pushstring(_L, [text UTF8String]);
-        if (lua_pcall(_L, 2, 1, 0) == LUA_OK) {
-            if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
-                allow = NO;
-            } else if (lua_istable(_L, -1)) {
-                lua_geti(_L, -1, 1);
-                if (lua_isnumber(_L, -1)) {
-                    modColor = (uint32_t)lua_tonumber(_L, -1);
-                    hasModColor = YES;
-                }
-                lua_pop(_L, 1);
+// ============================================================================
+// 5. INCOMING CHAT & DIALOG HOOKS -> samp.events
+// ============================================================================
 
-                lua_geti(_L, -1, 2);
-                if (lua_isstring(_L, -1)) {
-                    modText = SafeNSString(lua_tostring(_L, -1));
-                }
-                lua_pop(_L, 1);
+static void DispatchSampEvent(const char* eventName, uint32_t color, const std::string& text) {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    for (auto* s : g_Scripts) {
+        if (!s->enabled || !s->L || s->hasError) continue;
+        lua_State* L = s->L;
+        lua_getglobal(L, "_DISPATCH_SAMP_EVENT");
+        if (lua_isfunction(L, -1)) {
+            lua_pushstring(L, eventName);
+            lua_pushinteger(L, color);
+            lua_pushstring(L, text.c_str());
+            if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+                const char* err = lua_tostring(L, -1);
+                LogConsole("[Event " + std::string(eventName) + " ERROR] " + (err ? err : ""));
+                lua_pop(L, 1);
             }
         } else {
-            const char *err = lua_tostring(_L, -1);
-            AppendConsoleLog(std::string("[onServerMessage Error] ") + (err ? err : "unknown"));
+            lua_pop(L, 1);
         }
     }
-    lua_settop(_L, top);
-
-    if (outColor && hasModColor) *outColor = modColor;
-    if (outText && modText) *outText = modText;
-    return allow;
 }
 
-- (BOOL)dispatchShowDialog:(int)dialogId style:(int)style title:(NSString *)title btn1:(NSString *)btn1 btn2:(NSString *)btn2 text:(NSString *)text {
-    _inGameSession = YES;
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return YES;
-
-    __block BOOL allow = YES;
-    int top = lua_gettop(_L);
-    lua_getglobal(_L, "onShowDialog");
-    if (lua_isfunction(_L, -1)) {
-        lua_pushinteger(_L, dialogId);
-        lua_pushinteger(_L, style);
-        lua_pushstring(_L, [title UTF8String]);
-        lua_pushstring(_L, [btn1 UTF8String]);
-        lua_pushstring(_L, [btn2 UTF8String]);
-        lua_pushstring(_L, [text UTF8String]);
-        if (lua_pcall(_L, 6, 1, 0) == LUA_OK) {
-            if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
-                allow = NO;
+static void hooked_AddChatMessage(void* thisPtr, uint32_t color, const char* text) {
+    if (text) {
+        std::string utf8 = Cp1251ToUtf8(text);
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            g_ChatHistory.push_back({utf8, "", color, color});
+            if (g_ChatHistory.size() > 100) {
+                g_ChatHistory.erase(g_ChatHistory.begin());
             }
-        } else {
-            const char *err = lua_tostring(_L, -1);
-            AppendConsoleLog(std::string("[onShowDialog Error] ") + (err ? err : "unknown"));
         }
+        DispatchSampEvent("onServerMessage", color, utf8);
     }
-    lua_settop(_L, top);
-    return allow;
-}
-
-- (BOOL)dispatchOutgoingText:(NSString *)text {
-    if (!text || text.length == 0) return YES;
-
-    // Встроенная команда /luasettings открывает/закрывает ImGui меню
-    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([[trimmed lowercaseString] isEqualToString:@"/luasettings"]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            g_showImGuiMenu = !g_showImGuiMenu;
-        });
-        return NO;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    if (!_L) return YES;
-
-    // Проверка кастомных команд sampRegisterChatCommand
-    if ([trimmed hasPrefix:@"/"]) {
-        NSString *withoutSlash = [trimmed substringFromIndex:1];
-        NSRange sp = [withoutSlash rangeOfString:@" "];
-        NSString *cmdName = (sp.location == NSNotFound) ? withoutSlash : [withoutSlash substringToIndex:sp.location];
-        NSString *args = (sp.location == NSNotFound) ? @"" : [[withoutSlash substringFromIndex:sp.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSString *key = [cmdName lowercaseString];
-
-        NSNumber *cmdRef = self.commandRefs[key];
-        if (cmdRef) {
-            int top = lua_gettop(_L);
-            lua_rawgeti(_L, LUA_REGISTRYINDEX, [cmdRef intValue]);
-            if (lua_isfunction(_L, -1)) {
-                lua_pushstring(_L, [args UTF8String]);
-                if (lua_pcall(_L, 1, 0, 0) != LUA_OK) {
-                    const char *err = lua_tostring(_L, -1);
-                    AppendConsoleLog(std::string("[Command /") + [key UTF8String] + " Error] " + (err ? err : "unknown"));
-                }
-            }
-            lua_settop(_L, top);
-            return NO;
-        }
-
-        // Коллбэк onSendCommand(cmd)
-        int top = lua_gettop(_L);
-        lua_getglobal(_L, "onSendCommand");
-        if (lua_isfunction(_L, -1)) {
-            lua_pushstring(_L, [trimmed UTF8String]);
-            if (lua_pcall(_L, 1, 1, 0) == LUA_OK) {
-                if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
-                    lua_settop(_L, top);
-                    return NO;
-                }
-            }
-        }
-        lua_settop(_L, top);
-    } else {
-        // Коллбэк onSendChat(text)
-        int top = lua_gettop(_L);
-        lua_getglobal(_L, "onSendChat");
-        if (lua_isfunction(_L, -1)) {
-            lua_pushstring(_L, [trimmed UTF8String]);
-            if (lua_pcall(_L, 1, 1, 0) == LUA_OK) {
-                if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
-                    lua_settop(_L, top);
-                    return NO;
-                }
-            }
-        }
-        lua_settop(_L, top);
-    }
-
-    return YES;
-}
-
-- (void)addChatMessageLocal:(NSString *)text color:(uint32_t)color {
     if (orig_AddChatMessage) {
-        orig_AddChatMessage(color, [text UTF8String]);
-    } else {
-        AppendConsoleLog(std::string("[Chat] ") + [text UTF8String]);
+        orig_AddChatMessage(thisPtr, color, text);
     }
 }
 
-- (void)sendChatToGame:(NSString *)text {
-    if (!text) return;
-    if (![self dispatchOutgoingText:text]) return;
-    AppendConsoleLog(std::string("[SendChat] ") + [text UTF8String]);
+static void hooked_ShowDialog(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b) {
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        g_CurrentDialogId = id;
+        g_CurrentDialogStyle = style;
+        g_IsDialogActive = true;
+        g_CurrentDialogTitle = title ? Cp1251ToUtf8(title) : "";
+        g_CurrentDialogText = text ? Cp1251ToUtf8(text) : "";
+    }
+    if (orig_ShowDialog) {
+        orig_ShowDialog(thisPtr, id, style, title, text, btn1, btn2, b);
+    }
 }
 
 // ============================================================================
-// 10. UNUserNotificationCenterDelegate (iOS 14+ без deprecated флагов)
+// 6. MACH-O SYMBOL REBINDING (FISHHOOK) + UIKIT TEXTFIELD SWIZZLE
 // ============================================================================
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
-       willPresentNotification:(UNNotification *)notification
-         withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    completionHandler(UNNotificationPresentationOptionBanner |
-                      UNNotificationPresentationOptionList |
-                      UNNotificationPresentationOptionSound);
+
+struct Rebinding {
+    const char* name;
+    void* replacement;
+    void** replaced;
+};
+
+static void RebindSymbolsForImage(const struct mach_header* header, intptr_t slide, const std::vector<Rebinding>& rebindings) {
+    if (!header || header->magic != MH_MAGIC_64) return;
+    const auto* header64 = reinterpret_cast<const struct mach_header_64*>(header);
+
+    const struct segment_command_64* linkeditSeg = nullptr;
+    const struct symtab_command* symtabCmd = nullptr;
+    const struct dysymtab_command* dysymtabCmd = nullptr;
+
+    uintptr_t cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header64->ncmds; i++) {
+        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
+        if (cmd->cmd == LC_SEGMENT_64) {
+            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkeditSeg = seg;
+        } else if (cmd->cmd == LC_SYMTAB) {
+            symtabCmd = reinterpret_cast<const struct symtab_command*>(cmd);
+        } else if (cmd->cmd == LC_DYSYMTAB) {
+            dysymtabCmd = reinterpret_cast<const struct dysymtab_command*>(cmd);
+        }
+        cur += cmd->cmdsize;
+    }
+
+    if (!linkeditSeg || !symtabCmd || !dysymtabCmd || dysymtabCmd->nindirectsyms == 0) return;
+
+    uintptr_t linkeditBase = static_cast<uintptr_t>(slide) + linkeditSeg->vmaddr - linkeditSeg->fileoff;
+    const auto* symtab = reinterpret_cast<const struct nlist_64*>(linkeditBase + symtabCmd->symoff);
+    const char* strtab = reinterpret_cast<const char*>(linkeditBase + symtabCmd->stroff);
+    const uint32_t* indirectSymtab = reinterpret_cast<const uint32_t*>(linkeditBase + dysymtabCmd->indirectsymoff);
+
+    cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header64->ncmds; i++) {
+        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
+        if (cmd->cmd == LC_SEGMENT_64) {
+            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
+            if (strcmp(seg->segname, SEG_DATA) == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
+                const auto* sects = reinterpret_cast<const struct section_64*>(cur + sizeof(struct segment_command_64));
+                for (uint32_t j = 0; j < seg->nsects; j++) {
+                    uint32_t type = sects[j].flags & SECTION_TYPE;
+                    if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+
+                    uint32_t indirectOffset = sects[j].reserved1;
+                    size_t count = sects[j].size / sizeof(void*);
+                    void** bindings = reinterpret_cast<void**>(static_cast<uintptr_t>(slide) + sects[j].addr);
+
+                    for (size_t k = 0; k < count; k++) {
+                        uint32_t symIdx = indirectSymtab[indirectOffset + k];
+                        if (symIdx == INDIRECT_SYMBOL_ABS || symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+                        uint32_t strOffset = symtab[symIdx].n_un.n_strx;
+                        if (strOffset == 0) continue;
+                        const char* symName = strtab + strOffset;
+                        if (symName[0] == '_') symName++;
+
+                        for (const auto& reb : rebindings) {
+                            if (strcmp(symName, reb.name) == 0) {
+                                if (reb.replaced && *reb.replaced == nullptr && bindings[k] != reb.replacement) {
+                                    *reb.replaced = bindings[k];
+                                }
+                                bindings[k] = reb.replacement;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur += cmd->cmdsize;
+    }
 }
 
-// ============================================================================
-// 11. Установка оверлея, уведомлений и перехватчиков
-// ============================================================================
-- (void)attachOverlayIfNeeded {
-    if (_overlayView && _overlayView.superview) return;
-    UIWindow *win = GetActiveKeyWindow();
-    if (!win) return;
-
-    _overlayView = [[LoaderMetalOverlayView alloc] initWithFrame:win.bounds];
-    _overlayView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [win addSubview:_overlayView];
-    AppendConsoleLog("ImGui Metal Overlay attached");
-}
-
-- (void)installHooks {
-    Fishhook::Rebinding rebs[] = {
-        {"AddChatMessage", (void *)hooked_AddChatMessage, (void **)&orig_AddChatMessage},
-        {"ShowDialog", (void *)hooked_ShowDialog, (void **)&orig_ShowDialog}
+static void InstallNativeHooks() {
+    std::vector<Rebinding> rebindings = {
+        {"Java_com_arizona_game_GTASA_OnInputEnd", (void*)hooked_OnInputEnd, (void**)&orig_OnInputEnd},
+        {"_ZN4CNetGame11SendCommandEPKc", (void*)hooked_SendCommand, (void**)&orig_SendCommand},
+        {"_ZN4CNetGame8SendChatEPKc", (void*)hooked_SendChat, (void**)&orig_SendChat},
+        {"_ZN11CChatWindow14AddChatMessageEjPKc", (void*)hooked_AddChatMessage, (void**)&orig_AddChatMessage},
+        {"_ZN7CDialog4ShowEiiPKcS1_S1_S1_b", (void*)hooked_ShowDialog, (void**)&orig_ShowDialog}
     };
-    Fishhook::rebind_symbols(rebs, 2);
+
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        RebindSymbolsForImage(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), rebindings);
+    }
+
+    // Also observe UITextField end-editing so native iOS keyboard submit intercepts /commands immediately
+    [[NSNotificationCenter defaultCenter] addObserverForName:UITextFieldTextDidEndEditingNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification* note) {
+        UITextField* tf = note.object;
+        if ([tf isKindOfClass:[UITextField class]] && tf.text.length > 0) {
+            std::string txt([tf.text UTF8String]);
+            if (TryExecuteChatCommand(txt)) {
+                tf.text = @""; // Clear input field so game doesn't forward the command
+            }
+        }
+    }];
 }
 
-- (void)boot {
-    [self ensureDirectories];
-    [self loadConfig];
-    [self installHooks];
-    [self reloadAllScripts];
+// ============================================================================
+// 7. LUA 5.4 C++ API FUNCTIONS (MOONLOADER + AZ + SAMP)
+// ============================================================================
 
-    UNUserNotificationCenter *unc = [UNUserNotificationCenter currentNotificationCenter];
-    unc.delegate = self;
-    [unc requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound) completionHandler:^(BOOL granted, NSError * _Nullable error) {}];
+static int l_print(lua_State* L) {
+    int n = lua_gettop(L);
+    std::string msg;
+    for (int i = 1; i <= n; i++) {
+        size_t len = 0;
+        const char* s = luaL_tolstring(L, i, &len);
+        if (i > 1) msg += "\t";
+        if (s) msg += std::string(s, len);
+        lua_pop(L, 1);
+    }
+    LogConsole(msg);
+    return 0;
+}
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self attachOverlayIfNeeded];
-        // Повторная проверка через 1.5с на случай, если игровое окно создаётся с задержкой
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self attachOverlayIfNeeded];
+static int l_wait(lua_State* L) {
+    lua_Integer ms = luaL_optinteger(L, 1, 0);
+    if (ms < 0) ms = 0;
+    lua_pushinteger(L, ms);
+    return lua_yield(L, 1);
+}
+
+static int l_lua_thread_create(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    bool suspended = lua_toboolean(L, 2);
+
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    LuaScriptInstance* inst = FindScriptByState(L);
+    if (!inst) return 0;
+
+    lua_State* co = lua_newthread(inst->L);
+    int ref = luaL_ref(inst->L, LUA_REGISTRYINDEX);
+
+    lua_pushvalue(L, 1);
+    lua_xmove(L, co, 1);
+
+    LuaCoroutine lc;
+    lc.co = co;
+    lc.ref = ref;
+    lc.wakeTimeMs = NowMs();
+    lc.suspended = suspended;
+    lc.finished = false;
+    inst->threads.push_back(lc);
+
+    lua_newtable(L);
+    lua_pushinteger(L, ref);
+    lua_setfield(L, -2, "_ref");
+    return 1;
+}
+
+static int l_sampRegisterChatCommand(lua_State* L) {
+    const char* rawCmd = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    std::string cmd = rawCmd;
+    if (!cmd.empty() && cmd[0] == '/') cmd = cmd.substr(1);
+    cmd = ToLowerASCII(cmd);
+
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    LuaScriptInstance* inst = FindScriptByState(L);
+
+    auto oldIt = g_ChatCommands.find(cmd);
+    if (oldIt != g_ChatCommands.end() && oldIt->second.L && oldIt->second.funcRef != LUA_NOREF) {
+        luaL_unref(oldIt->second.L, LUA_REGISTRYINDEX, oldIt->second.funcRef);
+    }
+
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    RegisteredCommand rc;
+    rc.scriptName = inst ? inst->filename : "unknown";
+    rc.L = inst ? inst->L : L;
+    rc.funcRef = ref;
+    g_ChatCommands[cmd] = rc;
+
+    LogConsole("[CMD] Зарегистрирована команда /" + cmd);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_sampUnregisterChatCommand(lua_State* L) {
+    const char* rawCmd = luaL_checkstring(L, 1);
+    std::string cmd = rawCmd;
+    if (!cmd.empty() && cmd[0] == '/') cmd = cmd.substr(1);
+    cmd = ToLowerASCII(cmd);
+
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    auto it = g_ChatCommands.find(cmd);
+    if (it != g_ChatCommands.end()) {
+        if (it->second.L && it->second.funcRef != LUA_NOREF) {
+            luaL_unref(it->second.L, LUA_REGISTRYINDEX, it->second.funcRef);
+        }
+        g_ChatCommands.erase(it);
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+static int l_sampIsChatCommandDefined(lua_State* L) {
+    const char* rawCmd = luaL_checkstring(L, 1);
+    std::string cmd = rawCmd;
+    if (!cmd.empty() && cmd[0] == '/') cmd = cmd.substr(1);
+    cmd = ToLowerASCII(cmd);
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    lua_pushboolean(L, g_ChatCommands.find(cmd) != g_ChatCommands.end());
+    return 1;
+}
+
+static int l_sampAddChatMessage(lua_State* L) {
+    const char* text = luaL_checkstring(L, 1);
+    uint32_t color = static_cast<uint32_t>(luaL_optinteger(L, 2, 0xFFFFFFFF));
+    std::string utf8 = Cp1251ToUtf8(text);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        g_ChatHistory.push_back({utf8, "", color, color});
+        if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
+        g_Notifications.push_back({"Chat", utf8, NowMs() + 4500});
+    }
+
+    if (orig_AddChatMessage) {
+        std::string cp = Utf8ToCp1251(utf8);
+        orig_AddChatMessage(nullptr, color, cp.c_str());
+    }
+    LogConsole("[Chat] " + utf8);
+    return 0;
+}
+
+static int l_sampSendChat(lua_State* L) {
+    const char* text = luaL_checkstring(L, 1);
+    SendRawToGameChat(Cp1251ToUtf8(text));
+    return 0;
+}
+
+static int l_sampProcessChatInput(lua_State* L) {
+    const char* text = luaL_checkstring(L, 1);
+    std::string utf8 = Cp1251ToUtf8(text);
+    if (!TryExecuteChatCommand(utf8)) {
+        SendRawToGameChat(utf8);
+    }
+    return 0;
+}
+
+static int l_sampShowDialog(lua_State* L) {
+    int id = static_cast<int>(luaL_checkinteger(L, 1));
+    const char* title = luaL_optstring(L, 2, "");
+    const char* text = luaL_optstring(L, 3, "");
+    const char* btn1 = luaL_optstring(L, 4, "OK");
+    const char* btn2 = luaL_optstring(L, 5, "");
+    int style = static_cast<int>(luaL_optinteger(L, 6, 0));
+
+    std::string uTitle = Cp1251ToUtf8(title);
+    std::string uText = Cp1251ToUtf8(text);
+    std::string uBtn1 = Cp1251ToUtf8(btn1);
+    std::string uBtn2 = Cp1251ToUtf8(btn2);
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        g_CurrentDialogId = id;
+        g_CurrentDialogStyle = style;
+        g_IsDialogActive = true;
+        g_CurrentDialogTitle = uTitle;
+        g_CurrentDialogText = uText;
+    }
+
+    if (orig_ShowDialog) {
+        orig_ShowDialog(nullptr, id, style,
+                        Utf8ToCp1251(uTitle).c_str(),
+                        Utf8ToCp1251(uText).c_str(),
+                        Utf8ToCp1251(uBtn1).c_str(),
+                        Utf8ToCp1251(uBtn2).c_str(), false);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
+                                                                           message:[NSString stringWithUTF8String:uText.c_str()]
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
+            if (!uBtn2.empty()) {
+                [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
+            }
+            UIWindow* win = [[UIApplication sharedApplication] keyWindow];
+            [win.rootViewController presentViewController:alert animated:YES completion:nil];
         });
-    });
+    }
+    return 0;
 }
 
-@end
+static int l_sampGetCurrentDialogId(lua_State* L) { lua_pushinteger(L, g_CurrentDialogId); return 1; }
+static int l_sampGetCurrentDialogStyle(lua_State* L) { lua_pushinteger(L, g_CurrentDialogStyle); return 1; }
+static int l_sampIsDialogActive(lua_State* L) { lua_pushboolean(L, g_IsDialogActive); return 1; }
+static int l_sampGetDialogText(lua_State* L) { lua_pushstring(L, g_CurrentDialogText.c_str()); return 1; }
+static int l_sampGetDialogCaption(lua_State* L) { lua_pushstring(L, g_CurrentDialogTitle.c_str()); return 1; }
+static int l_sampIsChatInputActive(lua_State* L) { lua_pushboolean(L, g_IsChatInputActive); return 1; }
+static int l_sampGetChatInputText(lua_State* L) { lua_pushstring(L, g_ChatInputText.c_str()); return 1; }
+static int l_sampSetChatInputText(lua_State* L) { g_ChatInputText = luaL_optstring(L, 1, ""); return 0; }
+static int l_sampSetChatInputEnabled(lua_State* L) { g_IsChatInputActive = lua_toboolean(L, 1); return 0; }
+static int l_isSampAvailable(lua_State* L) { lua_pushboolean(L, 1); return 1; }
+static int l_isSampfuncsLoaded(lua_State* L) { lua_pushboolean(L, 1); return 1; }
+static int l_sampGetGamestate(lua_State* L) { lua_pushinteger(L, 3); return 1; } // GAMESTATE_CONNECTED
+
+static int l_sampGetChatString(lua_State* L) {
+    int id = static_cast<int>(luaL_checkinteger(L, 1));
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    int idx = static_cast<int>(g_ChatHistory.size()) - 1 - (99 - id);
+    if (idx >= 0 && idx < static_cast<int>(g_ChatHistory.size())) {
+        const auto& e = g_ChatHistory[idx];
+        lua_pushstring(L, e.text.c_str());
+        lua_pushstring(L, e.prefix.c_str());
+        lua_pushinteger(L, e.color);
+        lua_pushinteger(L, e.pcolor);
+        return 4;
+    }
+    lua_pushstring(L, "");
+    lua_pushstring(L, "");
+    lua_pushinteger(L, 0xFFFFFFFF);
+    lua_pushinteger(L, 0xFFFFFFFF);
+    return 4;
+}
+
+static int l_setTimeOfDay(lua_State* L) {
+    g_WorldHour = static_cast<int>(luaL_checkinteger(L, 1)) % 24;
+    g_WorldMinute = static_cast<int>(luaL_optinteger(L, 2, 0)) % 60;
+    LogConsole("[World] Установлено время: " + std::to_string(g_WorldHour) + ":" + (g_WorldMinute < 10 ? "0" : "") + std::to_string(g_WorldMinute));
+    return 0;
+}
+
+static int l_getTimeOfDay(lua_State* L) {
+    lua_pushinteger(L, g_WorldHour);
+    lua_pushinteger(L, g_WorldMinute);
+    return 2;
+}
+
+static int l_forceWeatherNow(lua_State* L) {
+    g_WorldWeather = static_cast<int>(luaL_checkinteger(L, 1));
+    LogConsole("[World] Установлена погода ID: " + std::to_string(g_WorldWeather));
+    return 0;
+}
+
+static int l_getScreenResolution(lua_State* L) {
+    CGRect bounds = [[UIScreen mainScreen] nativeBounds];
+    lua_pushinteger(L, static_cast<lua_Integer>(bounds.size.width));
+    lua_pushinteger(L, static_cast<lua_Integer>(bounds.size.height));
+    return 2;
+}
+
+static int l_getWorkingDirectory(lua_State* L) {
+    lua_pushstring(L, GetBaseDir().c_str());
+    return 1;
+}
+
+static int l_doesFileExist(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    BOOL isDir = NO;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithUTF8String:path] isDirectory:&isDir];
+    lua_pushboolean(L, exists && !isDir);
+    return 1;
+}
+
+static int l_doesDirectoryExist(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    BOOL isDir = NO;
+    BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithUTF8String:path] isDirectory:&isDir];
+    lua_pushboolean(L, exists && isDir);
+    return 1;
+}
+
+static int l_createDirectory(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    BOOL ok = [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:path]
+                                        withIntermediateDirectories:YES
+                                                         attributes:nil
+                                                              error:nil];
+    lua_pushboolean(L, ok);
+    return 1;
+}
+
+// az.* Native iOS functions
+static int l_az_vibrate(lua_State* L) {
+    int style = static_cast<int>(luaL_optinteger(L, 1, 1));
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIImpactFeedbackStyle s = UIImpactFeedbackStyleMedium;
+        if (style == 0) s = UIImpactFeedbackStyleLight;
+        else if (style >= 2) s = UIImpactFeedbackStyleHeavy;
+        UIImpactFeedbackGenerator* gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:s];
+        [gen prepare];
+        [gen impactOccurred];
+    });
+    return 0;
+}
+
+static int l_az_setClipboard(lua_State* L) {
+    const char* txt = luaL_checkstring(L, 1);
+    NSString* str = [NSString stringWithUTF8String:txt];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIPasteboard generalPasteboard].string = str;
+    });
+    return 0;
+}
+
+static int l_az_getClipboard(lua_State* L) {
+    NSString* str = [UIPasteboard generalPasteboard].string;
+    lua_pushstring(L, str ? [str UTF8String] : "");
+    return 1;
+}
+
+static int l_az_notify(lua_State* L) {
+    const char* title = luaL_checkstring(L, 1);
+    const char* msg = luaL_checkstring(L, 2);
+    double sec = luaL_optnumber(L, 3, 3.0);
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    g_Notifications.push_back({Cp1251ToUtf8(title), Cp1251ToUtf8(msg), NowMs() + static_cast<uint64_t>(sec * 1000.0)});
+    return 0;
+}
+
+static int l_az_openURL(lua_State* L) {
+    const char* url = luaL_checkstring(L, 1);
+    NSURL* nsurl = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+    if (nsurl) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] openURL:nsurl options:@{} completionHandler:nil];
+        });
+    }
+    return 0;
+}
+
+static float GetLoaderRAM_MB() {
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count) == KERN_SUCCESS) {
+        return static_cast<float>(vmInfo.phys_footprint) / (1024.0f * 1024.0f);
+    }
+    return 0.0f;
+}
+
+static int l_az_getLoaderRAM(lua_State* L) {
+    lua_pushnumber(L, GetLoaderRAM_MB());
+    return 1;
+}
+
+static int l_asyncHttpRequest(lua_State* L) {
+    const char* method = luaL_checkstring(L, 1);
+    const char* url = luaL_checkstring(L, 2);
+    const char* body = lua_isstring(L, 3) ? lua_tostring(L, 3) : nullptr;
+    int okRef = lua_isfunction(L, 4) ? (lua_pushvalue(L, 4), luaL_ref(L, LUA_REGISTRYINDEX)) : LUA_NOREF;
+    int errRef = lua_isfunction(L, 5) ? (lua_pushvalue(L, 5), luaL_ref(L, LUA_REGISTRYINDEX)) : LUA_NOREF;
+
+    NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithUTF8String:url]]];
+    req.HTTPMethod = [NSString stringWithUTF8String:method];
+    if (body) {
+        req.HTTPBody = [[NSString stringWithUTF8String:body] dataUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        if (!FindScriptByState(L)) return;
+
+        if (error) {
+            if (errRef != LUA_NOREF) {
+                lua_rawgeti(L, LUA_REGISTRYINDEX, errRef);
+                lua_pushstring(L, [[error localizedDescription] UTF8String]);
+                lua_pcall(L, 1, 0, 0);
+            }
+        } else if (okRef != LUA_NOREF) {
+            NSHTTPURLResponse* httpResp = (NSHTTPURLResponse*)response;
+            NSString* text = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+            lua_rawgeti(L, LUA_REGISTRYINDEX, okRef);
+            lua_newtable(L);
+            lua_pushinteger(L, httpResp ? httpResp.statusCode : 200);
+            lua_setfield(L, -2, "status_code");
+            lua_pushstring(L, text ? [text UTF8String] : "");
+            lua_setfield(L, -2, "text");
+            lua_pcall(L, 1, 0, 0);
+        }
+        if (okRef != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, okRef);
+        if (errRef != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, errRef);
+    }] resume];
+
+    return 0;
+}
 
 // ============================================================================
-// 12. Swizzling UITextField для перехвата ввода /luasettings и Lua-команд
+// 8. FULL MOONLOADER BUILT-IN RUNTIME & LIBRARIES (INJECTED INTO EVERY STATE)
 // ============================================================================
-static BOOL (*orig_textFieldShouldReturn)(id, SEL, UITextField *) = nullptr;
 
-static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField *textField) {
-    NSString *txt = textField.text;
-    if (txt.length > 0) {
-        if (![[LoaderEngine shared] dispatchOutgoingText:txt]) {
-            textField.text = @"";
-            [textField resignFirstResponder];
-            return NO;
+static const char* kMoonLoaderBootstrapLua = R"lua(
+-- 1. Metadata & Script Info
+_SCRIPT_META = {
+    name = "",
+    filename = "",
+    path = "",
+    directory = getWorkingDirectory(),
+    authors = {},
+    version = "",
+    version_num = 0,
+    description = "",
+    dependencies = {},
+    url = "",
+    properties = {}
+}
+
+function script_name(name) _SCRIPT_META.name = tostring(name or "") end
+function script_author(...) _SCRIPT_META.authors = {...} end
+function script_version(ver) _SCRIPT_META.version = tostring(ver or "") end
+function script_version_number(num) _SCRIPT_META.version_num = tonumber(num) or 0 end
+function script_description(desc) _SCRIPT_META.description = tostring(desc or "") end
+function script_dependencies(...) _SCRIPT_META.dependencies = {...} end
+function script_url(url) _SCRIPT_META.url = tostring(url or "") end
+function script_properties(...) _SCRIPT_META.properties = {...} end
+
+function thisScript()
+    return {
+        name = _SCRIPT_META.name,
+        filename = _SCRIPT_META.filename,
+        path = _SCRIPT_META.path,
+        directory = _SCRIPT_META.directory,
+        authors = _SCRIPT_META.authors,
+        version = _SCRIPT_META.version,
+        version_num = _SCRIPT_META.version_num,
+        description = _SCRIPT_META.description,
+        dependencies = _SCRIPT_META.dependencies,
+        url = _SCRIPT_META.url,
+        properties = _SCRIPT_META.properties,
+        unload = function() end,
+        reload = function() end,
+        pause = function() end,
+        resume = function() end
+    }
+end
+
+-- 2. GTA / Player Safe Compatibility Stubs
+PLAYER_PED = 1
+PLAYER_HANDLE = 0
+function isCharInAnyCar(ped) return false end
+function storeCarCharIsInNoSave(ped) return 0 end
+function getCharCoordinates(ped) return 0.0, 0.0, 0.0 end
+function setCharCoordinates(ped, x, y, z) end
+function getCharHealth(ped) return 100 end
+function setCharHealth(ped, hp) end
+function getCharArmour(ped) return 0 end
+function getCharHeading(ped) return 0.0 end
+function setCharHeading(ped, angle) end
+function addOneOffSound(x, y, z, id) if az and az.vibrate then az.vibrate(0) end end
+function printStringNow(text, time) if az and az.notify then az.notify("GTA", tostring(text), (time or 2000)/1000.0) end end
+function printString(text, time) printStringNow(text, time) end
+function isKeyDown(vk) return false end
+function wasKeyPressed(vk) return false end
+function isKeyJustPressed(vk) return false end
+function convert3DCoordsToScreen(x, y, z) return 0, 0 end
+function convert3DCoordsToScreenEx(x, y, z) return false, 0, 0, 0, 0, 0 end
+
+-- Additional SAMP compatibility functions
+function sampGetCurrentServerName() return "Arizona RP Mobile" end
+function sampGetCurrentServerAddress() return "127.0.0.1", 7777 end
+function sampGetPlayerNickname(id) return "Player_" .. tostring(id or 0) end
+function sampGetPlayerScore(id) return 1 end
+function sampGetPlayerPing(id) return 20 end
+function sampGetPlayerColor(id) return 0xFFFFFFFF end
+function sampGetPlayerHealth(id) return 100 end
+function sampGetPlayerArmor(id) return 0 end
+function sampIsPlayerConnected(id) return true end
+function sampIsPlayerNpc(id) return false end
+function sampGetMaxPlayerId(streamed) return 1000 end
+function sampGetPlayerIdByCharHandle(ped) return true, 0 end
+function sampGetCharHandleBySampPlayerId(id) return false, 0 end
+function sampSendDialogResponse(id, btn, item, input) end
+function sampCloseCurrentDialogWithButton(btn) end
+function sampSendClickTextdraw(id) end
+function sampTextdrawIsExists(id) return false end
+function sampTextdrawGetString(id) return "" end
+function sampCreate3dText(...) return 1 end
+function sampDestroy3dText(id) end
+function sampIs3dTextDefined(id) return false end
+
+-- 3. Built-in 'samp.events' library
+local _sampev = {}
+package.preload["samp.events"] = function() return _sampev end
+package.preload["lib.samp.events"] = function() return _sampev end
+
+function _DISPATCH_SAMP_EVENT(name, ...)
+    local fn = _sampev[name]
+    if type(fn) == "function" then
+        return fn(...)
+    end
+end
+
+-- 4. Built-in 'inicfg' library (saves into Documents/lua_loader/config/)
+package.preload["inicfg"] = function()
+    local inicfg = {}
+    local cfgDir = getWorkingDirectory() .. "/config/"
+
+    local function resolvePath(filename)
+        if not filename then filename = "default.ini" end
+        if filename:find("^/") then return filename end
+        if not filename:match("%.ini$") then filename = filename .. ".ini" end
+        return cfgDir .. filename
+    end
+
+    local function deepCopy(t)
+        local r = {}
+        for k, v in pairs(t or {}) do
+            r[k] = type(v) == "table" and deepCopy(v) or v
+        end
+        return r
+    end
+
+    function inicfg.load(defaultTbl, filename)
+        local data = deepCopy(defaultTbl)
+        local path = resolvePath(filename)
+        local f = io.open(path, "r")
+        if not f then return data end
+        local section = nil
+        for line in f:lines() do
+            line = line:gsub("\r$", "")
+            local sec = line:match("^%s*%[([^%]]+)%]%s*$")
+            if sec then
+                section = sec
+                data[section] = data[section] or {}
+            else
+                local k, v = line:match("^%s*([^=;#]+)%s*=%s*(.-)%s*$")
+                if k and v then
+                    local target = section and (data[section] or {}) or data
+                    if section then data[section] = target end
+                    if v == "true" then target[k] = true
+                    elseif v == "false" then target[k] = false
+                    elseif tonumber(v) then target[k] = tonumber(v)
+                    else target[k] = v end
+                end
+            end
+        end
+        f:close()
+        return data
+    end
+
+    function inicfg.save(data, filename)
+        local path = resolvePath(filename)
+        local f = io.open(path, "w")
+        if not f then return false end
+        for k, v in pairs(data or {}) do
+            if type(v) == "table" then
+                f:write("[" .. tostring(k) .. "]\n")
+                for sk, sv in pairs(v) do
+                    f:write(tostring(sk) .. "=" .. tostring(sv) .. "\n")
+                end
+                f:write("\n")
+            else
+                f:write(tostring(k) .. "=" .. tostring(v) .. "\n")
+            end
+        end
+        f:close()
+        return true
+    end
+
+    return inicfg
+end
+
+-- 5. Built-in 'encoding' library (CP1251 <-> UTF-8 for Russian MoonLoader scripts)
+package.preload["encoding"] = function()
+    local encoding = { default = "CP1251" }
+    local utf8mt = {
+        __call = function(_, s) return tostring(s or "") end
+    }
+    local utf8Obj = setmetatable({}, utf8mt)
+    function utf8Obj:decode(s) return tostring(s or "") end
+    function utf8Obj:encode(s) return tostring(s or "") end
+    encoding.UTF8 = utf8Obj
+    encoding.CP1251 = utf8Obj
+    return encoding
+end
+
+-- 6. Built-in JSON library + global encodeJson / decodeJson
+local function _json_encode(val)
+    local t = type(val)
+    if val == nil then return "null"
+    elseif t == "boolean" then return val and "true" or "false"
+    elseif t == "number" then return tostring(val)
+    elseif t == "string" then
+        return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r') .. '"'
+    elseif t == "table" then
+        local isArr = (#val > 0)
+        local parts = {}
+        if isArr then
+            for i = 1, #val do parts[#parts + 1] = _json_encode(val[i]) end
+            return "[" .. table.concat(parts, ",") .. "]"
+        else
+            for k, v in pairs(val) do
+                parts[#parts + 1] = _json_encode(tostring(k)) .. ":" .. _json_encode(v)
+            end
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+    end
+    return "null"
+end
+
+local function _json_decode(str)
+    if type(str) ~= "string" then return nil end
+    local luaExpr = str
+        :gsub('"%s*:%s*', '"]=')
+        :gsub('{%s*"', '{["')
+        :gsub(',%s*"', ',["')
+        :gsub('%[', '{')
+        :gsub('%]', '}')
+        :gsub(':%s*true', '=true')
+        :gsub(':%s*false', '=false')
+        :gsub(':%s*null', '=nil')
+    local fn = load("return " .. luaExpr)
+    if fn then
+        local ok, res = pcall(fn)
+        if ok then return res end
+    end
+    return nil
+end
+
+encodeJson = _json_encode
+decodeJson = _json_decode
+local _json_mod = { encode = _json_encode, decode = _json_decode }
+package.preload["cjson"] = function() return _json_mod end
+package.preload["json"] = function() return _json_mod end
+
+-- 7. Built-in 'vkeys' library
+package.preload["vkeys"] = function()
+    return {
+        VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_BACK = 0x08, VK_TAB = 0x09,
+        VK_RETURN = 0x0D, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12,
+        VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_LEFT = 0x25, VK_UP = 0x26,
+        VK_RIGHT = 0x27, VK_DOWN = 0x28, VK_DELETE = 0x2E,
+        VK_0 = 0x30, VK_1 = 0x31, VK_2 = 0x32, VK_3 = 0x33, VK_4 = 0x34,
+        VK_5 = 0x35, VK_6 = 0x36, VK_7 = 0x37, VK_8 = 0x38, VK_9 = 0x39,
+        VK_A = 0x41, VK_B = 0x42, VK_C = 0x43, VK_D = 0x44, VK_E = 0x45,
+        VK_F = 0x46, VK_G = 0x47, VK_H = 0x48, VK_I = 0x49, VK_J = 0x4A,
+        VK_K = 0x4B, VK_L = 0x4C, VK_M = 0x4D, VK_N = 0x4E, VK_O = 0x4F,
+        VK_P = 0x50, VK_Q = 0x51, VK_R = 0x52, VK_S = 0x53, VK_T = 0x54,
+        VK_U = 0x55, VK_V = 0x56, VK_W = 0x57, VK_X = 0x58, VK_Y = 0x59, VK_Z = 0x5A,
+        VK_F1 = 0x70, VK_F2 = 0x71, VK_F3 = 0x72, VK_F4 = 0x73, VK_F5 = 0x74,
+        VK_F6 = 0x75, VK_F7 = 0x76, VK_F8 = 0x77, VK_F9 = 0x78, VK_F10 = 0x79,
+        VK_F11 = 0x7A, VK_F12 = 0x7B
+    }
+end
+
+-- 8. Built-in 'ffi' & 'memory' & 'lfs' & 'mimgui' shims
+package.preload["ffi"] = function()
+    return {
+        cdef = function() end,
+        new = function(ct, init) return { _val = init or "" } end,
+        cast = function(ct, val) return val end,
+        string = function(ptr) return type(ptr) == "table" and tostring(ptr._val or "") or tostring(ptr or "") end,
+        sizeof = function() return 4 end
+    }
+end
+
+package.preload["memory"] = function()
+    return {
+        read = function() return 0 end,
+        write = function() end,
+        fill = function() end,
+        tostring = function() return "" end,
+        hex2bin = function(h) return h end,
+        bin2hex = function(b) return b end
+    }
+end
+
+package.preload["lfs"] = function()
+    return {
+        currentdir = function() return getWorkingDirectory() end,
+        mkdir = function(p) return createDirectory(p) end,
+        attributes = function(p) return doesFileExist(p) and { mode = "file" } or (doesDirectoryExist(p) and { mode = "directory" } or nil) end
+    }
+end
+
+package.preload["mimgui"] = function()
+    local m = setmetatable({}, { __index = imgui })
+    m.new = {
+        bool = function(v) return { [0] = v or false } end,
+        int = function(v) return { [0] = v or 0 } end,
+        float = function(v) return { [0] = v or 0.0 } end,
+        char = setmetatable({}, { __index = function() return function(s) return { _val = s or "" } end end })
+    }
+    m.StrCopy = function(dst, src) if type(dst) == "table" then dst._val = tostring(src or "") end end
+    m.OnInitialize = function(fn) if type(fn) == "function" then fn() end end
+    return m
+end
+)lua";
+
+// ImGui Lua bindings
+static int l_imgui_Begin(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    bool open = true;
+    bool hasClose = lua_isboolean(L, 2);
+    if (hasClose) open = lua_toboolean(L, 2);
+    bool visible = ImGui::Begin(name, hasClose ? &open : nullptr);
+    lua_pushboolean(L, visible);
+    if (hasClose) {
+        lua_pushboolean(L, open);
+        return 2;
+    }
+    return 1;
+}
+static int l_imgui_End(lua_State* L) { ImGui::End(); return 0; }
+static int l_imgui_Text(lua_State* L) {
+    const char* txt = luaL_checkstring(L, 1);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(txt);
+    ImGui::PopTextWrapPos();
+    return 0;
+}
+static int l_imgui_Button(lua_State* L) {
+    const char* label = luaL_checkstring(L, 1);
+    lua_pushboolean(L, ImGui::Button(label));
+    return 1;
+}
+static int l_imgui_SameLine(lua_State* L) { ImGui::SameLine(); return 0; }
+static int l_imgui_Separator(lua_State* L) { ImGui::Separator(); return 0; }
+static int l_imgui_OnFrame(lua_State* L) {
+    // Expects (condFn, drawFn) or (drawFn)
+    int drawIdx = lua_isfunction(L, 2) ? 2 : 1;
+    luaL_checktype(L, drawIdx, LUA_TFUNCTION);
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    LuaScriptInstance* inst = FindScriptByState(L);
+    if (inst) {
+        if (inst->renderCallbackRef != LUA_NOREF) {
+            luaL_unref(inst->L, LUA_REGISTRYINDEX, inst->renderCallbackRef);
+        }
+        lua_pushvalue(L, drawIdx);
+        inst->renderCallbackRef = luaL_ref(inst->L, LUA_REGISTRYINDEX);
+    }
+    return 0;
+}
+
+static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const std::string& fullPath) {
+    luaL_openlibs(L);
+
+    // Add Documents/lua_loader/lib/?.lua to package.path
+    std::string base = GetBaseDir();
+    std::string pkgCode = "package.path = package.path .. ';" + base + "/lib/?.lua;" + base + "/lib/?/init.lua'";
+    luaL_dostring(L, pkgCode.c_str());
+
+    lua_register(L, "print", l_print);
+    lua_register(L, "wait", l_wait);
+
+    // lua_thread table
+    lua_newtable(L);
+    lua_pushcfunction(L, l_lua_thread_create);
+    lua_setfield(L, -2, "create");
+    lua_pushcfunction(L, l_lua_thread_create);
+    lua_setfield(L, -2, "create_suspended");
+    lua_setglobal(L, "lua_thread");
+
+    // SAMP globals
+    lua_register(L, "sampRegisterChatCommand", l_sampRegisterChatCommand);
+    lua_register(L, "sampUnregisterChatCommand", l_sampUnregisterChatCommand);
+    lua_register(L, "sampIsChatCommandDefined", l_sampIsChatCommandDefined);
+    lua_register(L, "sampAddChatMessage", l_sampAddChatMessage);
+    lua_register(L, "sampSendChat", l_sampSendChat);
+    lua_register(L, "sampProcessChatInput", l_sampProcessChatInput);
+    lua_register(L, "sampShowDialog", l_sampShowDialog);
+    lua_register(L, "sampGetCurrentDialogId", l_sampGetCurrentDialogId);
+    lua_register(L, "sampGetCurrentDialogStyle", l_sampGetCurrentDialogStyle);
+    lua_register(L, "sampIsDialogActive", l_sampIsDialogActive);
+    lua_register(L, "sampGetDialogText", l_sampGetDialogText);
+    lua_register(L, "sampGetDialogCaption", l_sampGetDialogCaption);
+    lua_register(L, "sampIsChatInputActive", l_sampIsChatInputActive);
+    lua_register(L, "sampGetChatInputText", l_sampGetChatInputText);
+    lua_register(L, "sampSetChatInputText", l_sampSetChatInputText);
+    lua_register(L, "sampSetChatInputEnabled", l_sampSetChatInputEnabled);
+    lua_register(L, "sampGetChatString", l_sampGetChatString);
+    lua_register(L, "isSampAvailable", l_isSampAvailable);
+    lua_register(L, "isSampfuncsLoaded", l_isSampfuncsLoaded);
+    lua_register(L, "sampGetGamestate", l_sampGetGamestate);
+
+    // World / Filesystem / Screen globals
+    lua_register(L, "setTimeOfDay", l_setTimeOfDay);
+    lua_register(L, "getTimeOfDay", l_getTimeOfDay);
+    lua_register(L, "forceWeatherNow", l_forceWeatherNow);
+    lua_register(L, "getScreenResolution", l_getScreenResolution);
+    lua_register(L, "getWorkingDirectory", l_getWorkingDirectory);
+    lua_register(L, "getGameDirectory", l_getWorkingDirectory);
+    lua_register(L, "doesFileExist", l_doesFileExist);
+    lua_register(L, "doesDirectoryExist", l_doesDirectoryExist);
+    lua_register(L, "createDirectory", l_createDirectory);
+    lua_register(L, "asyncHttpRequest", l_asyncHttpRequest);
+
+    // az table
+    lua_newtable(L);
+    lua_pushcfunction(L, l_sampAddChatMessage); lua_setfield(L, -2, "chat");
+    lua_pushcfunction(L, l_sampSendChat); lua_setfield(L, -2, "send");
+    lua_pushcfunction(L, l_az_notify); lua_setfield(L, -2, "notify");
+    lua_pushcfunction(L, l_az_vibrate); lua_setfield(L, -2, "vibrate");
+    lua_pushcfunction(L, l_az_setClipboard); lua_setfield(L, -2, "setClipboard");
+    lua_pushcfunction(L, l_az_getClipboard); lua_setfield(L, -2, "getClipboard");
+    lua_pushcfunction(L, l_az_openURL); lua_setfield(L, -2, "openURL");
+    lua_pushcfunction(L, l_az_getLoaderRAM); lua_setfield(L, -2, "getLoaderRAM");
+    lua_setglobal(L, "az");
+
+    // imgui table
+    lua_newtable(L);
+    lua_pushcfunction(L, l_imgui_Begin); lua_setfield(L, -2, "Begin");
+    lua_pushcfunction(L, l_imgui_End); lua_setfield(L, -2, "End");
+    lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "Text");
+    lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "TextWrapped");
+    lua_pushcfunction(L, l_imgui_Button); lua_setfield(L, -2, "Button");
+    lua_pushcfunction(L, l_imgui_SameLine); lua_setfield(L, -2, "SameLine");
+    lua_pushcfunction(L, l_imgui_Separator); lua_setfield(L, -2, "Separator");
+    lua_pushcfunction(L, l_imgui_OnFrame); lua_setfield(L, -2, "OnFrame");
+    lua_setglobal(L, "imgui");
+
+    // Execute MoonLoader bootstrapper
+    if (luaL_dostring(L, kMoonLoaderBootstrapLua) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        LogConsole("[Bootstrap ERROR] " + std::string(err ? err : "unknown"));
+        lua_pop(L, 1);
+    }
+
+    // Populate script filename & path in _SCRIPT_META
+    lua_getglobal(L, "_SCRIPT_META");
+    if (lua_istable(L, -1)) {
+        lua_pushstring(L, filename.c_str()); lua_setfield(L, -2, "filename");
+        lua_pushstring(L, fullPath.c_str()); lua_setfield(L, -2, "path");
+    }
+    lua_pop(L, 1);
+}
+
+// ============================================================================
+// 9. SCRIPT LOADING, RELOADING & TICKING
+// ============================================================================
+
+static void UnloadSingleScript(LuaScriptInstance* inst) {
+    if (!inst) return;
+    // Remove commands owned by this script
+    for (auto it = g_ChatCommands.begin(); it != g_ChatCommands.end(); ) {
+        if (it->second.L == inst->L) {
+            it = g_ChatCommands.erase(it);
+        } else {
+            ++it;
         }
     }
-    if (orig_textFieldShouldReturn) {
-        return orig_textFieldShouldReturn(self, _cmd, textField);
+    if (inst->L) {
+        lua_close(inst->L);
+        inst->L = nullptr;
     }
-    return YES;
+    inst->threads.clear();
+    inst->renderCallbackRef = LUA_NOREF;
 }
 
-static void HookUITextFieldDelegates() {
-    int numClasses = objc_getClassList(NULL, 0);
-    if (numClasses <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
-    numClasses = objc_getClassList(classes, numClasses);
-    Protocol *proto = @protocol(UITextFieldDelegate);
-    SEL sel = @selector(textFieldShouldReturn:);
+static void LoadSingleScript(LuaScriptInstance* inst) {
+    UnloadSingleScript(inst);
+    inst->hasError = false;
+    inst->lastError.clear();
 
-    for (int i = 0; i < numClasses; i++) {
-        Class cls = classes[i];
-        if (class_conformsToProtocol(cls, proto)) {
-            Method m = class_getInstanceMethod(cls, sel);
-            if (m && !orig_textFieldShouldReturn) {
-                orig_textFieldShouldReturn = (BOOL (*)(id, SEL, UITextField *))method_getImplementation(m);
-                method_setImplementation(m, (IMP)swizzled_textFieldShouldReturn);
-                break;
+    // Read file & strip UTF-8 BOM if present
+    FILE* f = fopen(inst->fullPath.c_str(), "rb");
+    if (!f) {
+        inst->hasError = true;
+        inst->lastError = "Не удалось открыть файл: " + ShortenPathForUI(inst->fullPath);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string code(sz > 0 ? sz : 0, '\0');
+    if (sz > 0) fread(&code[0], 1, sz, f);
+    fclose(f);
+
+    if (code.size() >= 3 &&
+        static_cast<unsigned char>(code[0]) == 0xEF &&
+        static_cast<unsigned char>(code[1]) == 0xBB &&
+        static_cast<unsigned char>(code[2]) == 0xBF) {
+        code.erase(0, 3);
+    }
+
+    lua_State* L = luaL_newstate();
+    inst->L = L;
+    RegisterAllLuaAPI(L, inst->filename, inst->fullPath);
+
+    std::string chunkName = "@" + ShortenPathForUI(inst->fullPath);
+    if (luaL_loadbuffer(L, code.c_str(), code.size(), chunkName.c_str()) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        inst->hasError = true;
+        inst->lastError = err ? err : "Syntax error";
+        LogConsole("[ERROR] " + inst->lastError);
+        lua_pop(L, 1);
+        return;
+    }
+
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        inst->hasError = true;
+        inst->lastError = err ? err : "Runtime error";
+        LogConsole("[ERROR] " + inst->lastError);
+        lua_pop(L, 1);
+        return;
+    }
+
+    // Call onScriptLoad() if defined
+    lua_getglobal(L, "onScriptLoad");
+    if (lua_isfunction(L, -1)) {
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            LogConsole("[onScriptLoad ERROR] " + std::string(lua_tostring(L, -1) ?: ""));
+            lua_pop(L, 1);
+        }
+    } else {
+        lua_pop(L, 1);
+    }
+
+    // Start main() as a coroutine if defined
+    lua_getglobal(L, "main");
+    if (lua_isfunction(L, -1)) {
+        lua_State* co = lua_newthread(L);
+        int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        lua_xmove(L, co, 1);
+
+        LuaCoroutine lc;
+        lc.co = co;
+        lc.ref = ref;
+        lc.wakeTimeMs = NowMs();
+        inst->threads.push_back(lc);
+    } else {
+        lua_pop(L, 1);
+    }
+
+    LogConsole("[OK] Загружен скрипт: " + inst->filename);
+}
+
+static void ReloadAllScripts() {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    EnsureDirectories();
+
+    for (auto* s : g_Scripts) {
+        UnloadSingleScript(s);
+        delete s;
+    }
+    g_Scripts.clear();
+    g_ChatCommands.clear();
+
+    std::string scriptsDir = GetBaseDir() + "/scripts";
+    NSString* nsDir = [NSString stringWithUTF8String:scriptsDir.c_str()];
+    NSArray* files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:nsDir error:nil];
+
+    for (NSString* file in files) {
+        if (![file.pathExtension.lowercaseString isEqualToString:@"lua"]) continue;
+        auto* inst = new LuaScriptInstance();
+        inst->filename = [file UTF8String];
+        inst->fullPath = scriptsDir + "/" + inst->filename;
+        inst->displayName = inst->filename;
+        g_Scripts.push_back(inst);
+        LoadSingleScript(inst);
+    }
+}
+
+static void TickScripts() {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    uint64_t now = NowMs();
+
+    for (auto* s : g_Scripts) {
+        if (!s->enabled || !s->L || s->hasError) continue;
+
+        for (size_t i = 0; i < s->threads.size(); ) {
+            LuaCoroutine& t = s->threads[i];
+            if (t.finished || t.suspended || now < t.wakeTimeMs) {
+                i++;
+                continue;
+            }
+
+            int nres = 0;
+            int status = lua_resume(t.co, s->L, 0, &nres);
+            if (status == LUA_YIELD) {
+                lua_Integer waitMs = (nres >= 1 && lua_isinteger(t.co, -1)) ? lua_tointeger(t.co, -1) : 0;
+                if (nres > 0) lua_pop(t.co, nres);
+                t.wakeTimeMs = now + static_cast<uint64_t>(waitMs > 0 ? waitMs : 0);
+                i++;
+            } else if (status == LUA_OK) {
+                if (nres > 0) lua_pop(t.co, nres);
+                luaL_unref(s->L, LUA_REGISTRYINDEX, t.ref);
+                s->threads.erase(s->threads.begin() + i);
+            } else {
+                const char* err = lua_tostring(t.co, -1);
+                s->hasError = true;
+                s->lastError = err ? err : "Coroutine error";
+                LogConsole("[ERROR] " + s->lastError);
+                luaL_unref(s->L, LUA_REGISTRYINDEX, t.ref);
+                s->threads.erase(s->threads.begin() + i);
             }
         }
     }
-    free(classes);
 }
 
 // ============================================================================
-// 13. Точка входа dylib при инъекции в Arizona Mobile
+// 10. DEAR IMGUI OVERLAY (WITH PROPER TEXT WRAPPING!)
 // ============================================================================
-__attribute__((constructor))
-static void LoaderEntryPoint() {
-    @autoreleasepool {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            HookUITextFieldDelegates();
-            [[LoaderEngine shared] boot];
-        });
+
+static void RenderLoaderUI() {
+    TickScripts();
+
+    ImGuiIO& io = ImGui::GetIO();
+    float screenW = io.DisplaySize.x;
+    float screenH = io.DisplaySize.y;
+
+    // Floating circular "42" button (top-left)
+    ImGui::SetNextWindowPos(ImVec2(18, 42), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(54, 54), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 27.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.14f, 0.11f, 0.22f, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.55f, 0.35f, 0.85f, 0.90f));
+    if (ImGui::Begin("##42Btn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar)) {
+        if (ImGui::Button("42", ImVec2(54, 54))) {
+            g_MenuOpen = !g_MenuOpen;
+        }
     }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+
+    // RAM indicator on the right
+    float totalLuaKB = 0.0f;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        for (auto* s : g_Scripts) {
+            if (s->L) totalLuaKB += static_cast<float>(lua_gc(s->L, LUA_GCCOUNT, 0));
+        }
+    }
+    char ramStr[96];
+    snprintf(ramStr, sizeof(ramStr), "Loader RAM: %.2f MB (Lua: %.0f KB)", GetLoaderRAM_MB(), totalLuaKB);
+    ImGui::GetForegroundDrawList()->AddText(ImVec2(screenW - 245, screenH * 0.48f), IM_COL32(220, 220, 230, 180), ramStr);
+
+    // Active notifications (wrapped cleanly)
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        uint64_t now = NowMs();
+        float ny = 24.0f;
+        for (size_t i = 0; i < g_Notifications.size(); ) {
+            if (now > g_Notifications[i].expireMs) {
+                g_Notifications.erase(g_Notifications.begin() + i);
+                continue;
+            }
+            ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f - 170.0f, ny), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(340.0f, 0.0f), ImGuiCond_Always);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.10f, 0.18f, 0.92f));
+            char winName[32];
+            snprintf(winName, sizeof(winName), "##Notif_%zu", i);
+            if (ImGui::Begin(winName, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs)) {
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImVec4(0.68f, 0.45f, 0.98f, 1.0f), "%s", g_Notifications[i].title.c_str());
+                ImGui::TextUnformatted(g_Notifications[i].message.c_str());
+                ImGui::PopTextWrapPos();
+                ny += ImGui::GetWindowHeight() + 6.0f;
+            }
+            ImGui::End();
+            ImGui::PopStyleColor();
+            i++;
+        }
+    }
+
+    // Script ImGui OnFrame callbacks
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        for (auto* s : g_Scripts) {
+            if (s->enabled && s->L && !s->hasError && s->renderCallbackRef != LUA_NOREF) {
+                lua_rawgeti(s->L, LUA_REGISTRYINDEX, s->renderCallbackRef);
+                if (lua_pcall(s->L, 0, 0, 0) != LUA_OK) {
+                    s->hasError = true;
+                    s->lastError = lua_tostring(s->L, -1) ?: "ImGui render error";
+                    lua_pop(s->L, 1);
+                }
+            }
+        }
+    }
+
+    if (!g_MenuOpen) return;
+
+    // Main Loader Window
+    ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f - 260.0f, 36.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 310.0f), ImGuiCond_FirstUseEver);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.32f, 0.18f, 0.52f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.09f, 0.14f, 0.95f));
+
+    if (ImGui::Begin("Arizona 42Loader  |  Lua 5.4 + MoonLoader API", &g_MenuOpen)) {
+        if (ImGui::Button("Scripts")) g_SelectedTab = 0;
+        ImGui::SameLine();
+        if (ImGui::Button("Commands")) g_SelectedTab = 1;
+        ImGui::SameLine();
+        if (ImGui::Button("Console")) g_SelectedTab = 2;
+        ImGui::SameLine();
+        if (ImGui::Button("Settings")) g_SelectedTab = 3;
+
+        ImGui::Separator();
+
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+
+        if (g_SelectedTab == 0) {
+            if (ImGui::Button("Reload All Scripts")) {
+                ReloadAllScripts();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Dir: Documents/lua_loader/scripts");
+            ImGui::Separator();
+
+            ImGui::BeginChild("##ScriptsList", ImVec2(0, 0), false);
+            for (size_t i = 0; i < g_Scripts.size(); i++) {
+                LuaScriptInstance* s = g_Scripts[i];
+                ImGui::PushID(static_cast<int>(i));
+                bool prev = s->enabled;
+                if (ImGui::Checkbox("##en", &s->enabled) && prev != s->enabled) {
+                    if (s->enabled) LoadSingleScript(s);
+                    else UnloadSingleScript(s);
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(s->filename.c_str());
+                ImGui::SameLine();
+                if (s->hasError) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "[ERROR]");
+                } else if (s->enabled) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "[OK]");
+                } else {
+                    ImGui::TextDisabled("[OFF]");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reload")) {
+                    s->enabled = true;
+                    LoadSingleScript(s);
+                }
+
+                // Wrapped error output so text NEVER goes outside window bounds
+                if (s->hasError && !s->lastError.empty()) {
+                    ImGui::Indent(24.0f);
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", ShortenPathForUI(s->lastError).c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::Unindent(24.0f);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+
+        } else if (g_SelectedTab == 1) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted("Все команды ниже перехватываются прямо из чата SA-MP (регистр не важен, например /SETTIME или /settime):");
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+
+            for (const auto& kv : g_ChatCommands) {
+                ImGui::BulletText("/%s  (%s)", kv.first.c_str(), kv.second.scriptName.c_str());
+            }
+
+            ImGui::Separator();
+            ImGui::InputText("##TestCmd", g_CmdInputBuf, sizeof(g_CmdInputBuf));
+            ImGui::SameLine();
+            if (ImGui::Button("Выполнить")) {
+                if (strlen(g_CmdInputBuf) > 0) {
+                    TryExecuteChatCommand(g_CmdInputBuf);
+                    g_CmdInputBuf[0] = '\0';
+                }
+            }
+
+        } else if (g_SelectedTab == 2) {
+            if (ImGui::Button("Clear Console")) {
+                g_ConsoleLogs.clear();
+            }
+            ImGui::Separator();
+            ImGui::BeginChild("##ConsoleScroll", ImVec2(0, 0), true);
+            ImGui::PushTextWrapPos(0.0f);
+            for (const auto& line : g_ConsoleLogs) {
+                if (line.find("ERROR") != std::string::npos) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s", line.c_str());
+                } else {
+                    ImGui::TextUnformatted(line.c_str());
+                }
+            }
+            ImGui::PopTextWrapPos();
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+            ImGui::EndChild();
+
+        } else if (g_SelectedTab == 3) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::Text("Время мира: %02d:%02d | Погода ID: %d", g_WorldHour, g_WorldMinute, g_WorldWeather);
+            ImGui::Text("Активных скриптов: %zu | Команд в чате: %zu", g_Scripts.size(), g_ChatCommands.size());
+            ImGui::PopTextWrapPos();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+}
+
+// ============================================================================
+// 11. METAL RENDER HOOK & ENTRY POINT
+// ============================================================================
+
+static bool g_ImGuiInitialized = false;
+static id<MTLCommandQueue> (*orig_newCommandQueue)(id, SEL) = nullptr;
+
+static void SetupImGuiWithDevice(id<MTLDevice> device) {
+    if (g_ImGuiInitialized || !device) return;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplMetal_Init(device);
+    g_ImGuiInitialized = true;
+}
+
+static void (*orig_presentDrawable)(id, SEL, id<MTLDrawable>) = nullptr;
+static void swizzled_presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
+    if (g_ImGuiInitialized) {
+        UIWindow* keyWin = [[UIApplication sharedApplication] keyWindow];
+        if (keyWin) {
+            ImGuiIO& io = ImGui::GetIO();
+            CGFloat scale = [UIScreen mainScreen].scale;
+            io.DisplaySize = ImVec2(keyWin.bounds.size.width, keyWin.bounds.size.height);
+            io.DisplayFramebufferScale = ImVec2(scale, scale);
+
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            if ([drawable respondsToSelector:@selector(texture)]) {
+                rpd.colorAttachments[0].texture = [(id)drawable texture];
+                rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+                id<MTLCommandBuffer> cmdBuf = (id<MTLCommandBuffer>)self;
+                id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+                ImGui_ImplMetal_NewFrame(rpd);
+                ImGui::NewFrame();
+                RenderLoaderUI();
+                ImGui::Render();
+                ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmdBuf, enc);
+                [enc endEncoding];
+            }
+        }
+    }
+    if (orig_presentDrawable) {
+        orig_presentDrawable(self, _cmd, drawable);
+    }
+}
+
+__attribute__((constructor))
+static void LoaderEntry() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        EnsureDirectories();
+        InstallNativeHooks();
+        ReloadAllScripts();
+
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        SetupImGuiWithDevice(dev);
+
+        id<MTLCommandQueue> queue = [dev newCommandQueue];
+        id<MTLCommandBuffer> buf = [queue commandBuffer];
+        Class cmdBufClass = [buf class];
+        Method m = class_getInstanceMethod(cmdBufClass, @selector(presentDrawable:));
+        if (m) {
+            orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))method_getImplementation(m);
+            method_setImplementation(m, (IMP)swizzled_presentDrawable);
+        }
+        LogConsole("Arizona 42Loader инициализирован (MoonLoader + Chat Hooks активны)");
+    });
 }
