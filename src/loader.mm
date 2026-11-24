@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 #include <stdint.h>
+#import <Foundation/Foundation.h>
 
 typedef const char* (*GetStringUTFChars_t)(void* env, void* str, uint8_t* isCopy);
 typedef void (*ReleaseStringUTFChars_t)(void* env, void* str, const char* chars);
