@@ -17,7 +17,7 @@ jobs:
 
       - name: Download & patch Lua 5.4.7 for iOS
         run: |
-          mkdir -p build/lua
+          mkdir -p build/lua build/imgui
           curl -fsSL https://www.lua.org/ftp/lua-5.4.7.tar.gz -o lua-5.4.7.tar.gz
           tar -xzf lua-5.4.7.tar.gz
           python3 -c '
@@ -26,6 +26,12 @@ jobs:
           s = s.replace("int stat = system(cmd);", "int stat = (cmd == NULL) ? 0 : -1;")
           open(p, "w", encoding="utf-8").write(s)
           '
+
+      - name: Download Dear ImGui (v1.91.5)
+        run: |
+          curl -fsSL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.5.tar.gz -o imgui.tar.gz
+          tar -xzf imgui.tar.gz
+          mv imgui-1.91.5 imgui
 
       - name: Compile Lua 5.4.7 (arm64 iOS)
         run: |
@@ -42,6 +48,29 @@ jobs:
             fi
           done
 
+      - name: Compile Dear ImGui + Metal Backend (arm64 iOS)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          for f in imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp; do
+            clang++ -arch arm64 \
+              -isysroot "$SDK" \
+              -miphoneos-version-min=14.0 \
+              -std=c++17 \
+              -O2 \
+              -Iimgui \
+              -c "imgui/$f" -o "build/imgui/${f%.cpp}.o"
+          done
+          clang++ -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -std=c++17 \
+            -fobjc-arc \
+            -O2 \
+            -Iimgui \
+            -Iimgui/backends \
+            -c "imgui/backends/imgui_impl_metal.mm" \
+            -o "build/imgui/imgui_impl_metal.o"
+
       - name: Build LuaLoader.dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -54,13 +83,18 @@ jobs:
             -dynamiclib \
             -install_name @executable_path/Frameworks/LuaLoader.dylib \
             -Ilua-5.4.7/src \
+            -Iimgui \
+            -Iimgui/backends \
             build/lua/*.o \
+            build/imgui/*.o \
             src/*.mm \
             -o build/LuaLoader.dylib \
             -framework Foundation \
             -framework UIKit \
-            -framework UserNotifications \
-            -framework QuartzCore
+            -framework Metal \
+            -framework MetalKit \
+            -framework QuartzCore \
+            -framework UserNotifications
 
       - name: Ad-hoc sign & verify dylib
         run: |
