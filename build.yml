@@ -1,3 +1,4 @@
+
 name: Build LuaLoader.dylib (iOS arm64)
 
 on:
@@ -34,7 +35,6 @@ jobs:
           tar -xzf lua-5.4.7.tar.gz
           cp lua-5.4.7/src/*.c lua-5.4.7/src/*.h lua-5.4.7/src/lua.hpp build/lua/
           rm -f build/lua/lua.c build/lua/luac.c
-          # Disable os.execute/system on the embedded iOS Lua runtime.
           sed -i '' 's/#define l_system(cmd).*/#define l_system(cmd) ((cmd) == NULL ? 0 : -1)/g' build/lua/loslib.c
           test -s build/lua/lua.h
           test -s build/lua/loslib.c
