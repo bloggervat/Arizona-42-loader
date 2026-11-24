@@ -1,14 +1,22 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <UserNotifications/UserNotifications.h>
+#import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <string.h>
-#import <stdlib.h>
+#import <mach/mach.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 extern "C" {
 #include "lua.h"
@@ -16,727 +24,343 @@ extern "C" {
 #include "lualib.h"
 }
 
-#if LUA_VERSION_NUM >= 504
-#define AZ_LUA_RESUME(co, from, nargs, nres) lua_resume((co), (from), (nargs), (nres))
-#else
-#define AZ_LUA_RESUME(co, from, nargs, nres) lua_resume((co), (from), (nargs))
-#endif
+#include "imgui.h"
+#include "imgui_impl_metal.h"
 
-#ifdef __LP64__
-typedef struct mach_header_64 mach_header_t;
-typedef struct segment_command_64 segment_command_t;
-typedef struct section_64 section_t;
-typedef struct nlist_64 nlist_t;
-#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT_64
-#else
-typedef struct mach_header mach_header_t;
-typedef struct segment_command segment_command_t;
-typedef struct section section_t;
-typedef struct nlist nlist_t;
-#define LC_SEGMENT_ARCH_DEPENDENT LC_SEGMENT
-#endif
+// ============================================================================
+// 1. Учёт потребления RAM исключительно самим лоадером
+// ============================================================================
 
-struct Rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
+static std::atomic<size_t> g_luaTrackedBytes{0};
+static std::atomic<size_t> g_loaderExtraBytes{0};
+
+static void *LoaderLuaAlloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    (void)ud;
+    if (nsize == 0) {
+        if (ptr != nullptr) {
+            size_t cur = g_luaTrackedBytes.load(std::memory_order_relaxed);
+            g_luaTrackedBytes.store(cur >= osize ? cur - osize : 0, std::memory_order_relaxed);
+            free(ptr);
+        }
+        return nullptr;
+    }
+    void *newPtr = realloc(ptr, nsize);
+    if (newPtr != nullptr) {
+        size_t oldSz = (ptr != nullptr) ? osize : 0;
+        if (nsize >= oldSz) {
+            g_luaTrackedBytes.fetch_add(nsize - oldSz, std::memory_order_relaxed);
+        } else {
+            size_t diff = oldSz - nsize;
+            size_t cur = g_luaTrackedBytes.load(std::memory_order_relaxed);
+            g_luaTrackedBytes.store(cur >= diff ? cur - diff : 0, std::memory_order_relaxed);
+        }
+    }
+    return newPtr;
+}
+
+static size_t GetLoaderDylibFootprintBytes() {
+    Dl_info info;
+    if (dladdr((const void *)&LoaderLuaAlloc, &info) == 0 || info.dli_fbase == nullptr) {
+        return 0;
+    }
+    const struct mach_header_64 *header = (const struct mach_header_64 *)info.dli_fbase;
+    if (header->magic != MH_MAGIC_64) return 0;
+
+    size_t totalBytes = 0;
+    const uint8_t *cmdPtr = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmdPtr;
+            if (strcmp(seg->segname, "__TEXT") == 0 ||
+                strcmp(seg->segname, "__DATA") == 0 ||
+                strcmp(seg->segname, "__DATA_CONST") == 0) {
+                totalBytes += (size_t)seg->vmsize;
+            }
+        }
+        cmdPtr += lc->cmdsize;
+    }
+    return totalBytes;
+}
+
+struct LoaderMemoryStats {
+    size_t luaBytes;
+    size_t extraBytes;
+    size_t dylibBytes;
+    size_t totalBytes;
 };
 
-static NSMutableArray<NSValue *> *gRebindings = nil;
-
-static void perform_rebinding_with_section(section_t *data_sect, intptr_t slide, nlist_t *symtab, char *strtab, uint32_t *indirect_symtab) {
-    uint32_t *indirect_symbol_indices = indirect_symtab + data_sect->reserved1;
-    void **indirect_symbol_bindings = (void **)((uintptr_t)slide + data_sect->addr);
-    size_t count = data_sect->size / sizeof(void *);
-    for (size_t i = 0; i < count; i++) {
-        uint32_t symtab_index = indirect_symbol_indices[i];
-        if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
-            symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
-            continue;
-        }
-        uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
-        char *symbol_name = strtab + strtab_offset;
-        if (strnlen(symbol_name, 2) < 2) continue;
-        for (NSValue *val in gRebindings) {
-            struct Rebinding rb;
-            [val getValue:&rb];
-            if (strcmp(&symbol_name[1], rb.name) == 0) {
-                if (rb.replaced != NULL && *rb.replaced == NULL) {
-                    *rb.replaced = indirect_symbol_bindings[i];
-                }
-                indirect_symbol_bindings[i] = rb.replacement;
-                break;
-            }
-        }
-    }
+static LoaderMemoryStats GetLoaderMemoryStats() {
+    static size_t cachedDylibBytes = GetLoaderDylibFootprintBytes();
+    LoaderMemoryStats st;
+    st.luaBytes = g_luaTrackedBytes.load(std::memory_order_relaxed);
+    st.extraBytes = g_loaderExtraBytes.load(std::memory_order_relaxed);
+    st.dylibBytes = cachedDylibBytes;
+    st.totalBytes = st.luaBytes + st.extraBytes + st.dylibBytes;
+    return st;
 }
 
-static void rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
-    if (!gRebindings || gRebindings.count == 0) return;
-    Dl_info info;
-    if (dladdr(header, &info) == 0) return;
+// ============================================================================
+// 2. Структуры рендера, трейсеров, логов и состояния ImGui
+// ============================================================================
 
-    segment_command_t *cur_seg_cmd;
-    segment_command_t *linkedit_segment = NULL;
-    struct symtab_command *symtab_cmd = NULL;
-    struct dysymtab_command *dysymtab_cmd = NULL;
+struct TracerItem {
+    std::string id;
+    bool is3D = false;
+    float x1 = 0.0f, y1 = 0.0f;
+    float x2 = 0.0f, y2 = 0.0f;
+    float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+    ImU32 color = IM_COL32(168, 85, 247, 230);
+    float thickness = 2.0f;
+    std::string label;
+};
 
-    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
-    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (segment_command_t *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
-                linkedit_segment = cur_seg_cmd;
-            }
-        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
-            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
-        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
-            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
-        }
-    }
+struct DrawCommandItem {
+    enum Type { LINE, BOX, BOX_FILLED, CIRCLE, CIRCLE_FILLED, TEXT } type;
+    float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    float radius = 0, thickness = 1.0f, rounding = 0.0f;
+    int segments = 24;
+    ImU32 color = IM_COL32_WHITE;
+    bool shadow = true;
+    std::string text;
+};
 
-    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment || !dysymtab_cmd->nindirectsyms) return;
+struct LogEntry {
+    int level; // 0 = INFO, 1 = LUA, 2 = ERROR
+    std::string message;
+};
 
-    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
-    nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
-    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
-    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+static std::mutex g_renderMutex;
+static std::vector<TracerItem> g_tracers;
+static std::vector<DrawCommandItem> g_frameDrawCommands;
 
-    cur = (uintptr_t)header + sizeof(mach_header_t);
-    for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
-        cur_seg_cmd = (segment_command_t *)cur;
-        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
-            if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-                strcmp(cur_seg_cmd->segname, "__DATA_CONST") != 0) {
-                continue;
-            }
-            for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
-                section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
-                if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
-                    (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-                    perform_rebinding_with_section(sect, slide, symtab, strtab, indirect_symtab);
-                }
-            }
-        }
-    }
-}
+static std::mutex g_logMutex;
+static std::vector<LogEntry> g_logs;
+static const size_t kMaxLogs = 300;
 
-static void register_rebinding(const char *name, void *replacement, void **replaced) {
+static bool g_menuOpen = false;
+static bool g_showRamHud = true;
+static bool g_tracersEnabled = true;
+static bool g_demoTracers = false;
+static int g_tracerOriginMode = 0; // 0 = Низ экрана, 1 = Центр, 2 = Верх
+static float g_tracerThickness = 2.0f;
+static float g_tracerColor[4] = {0.66f, 0.33f, 0.97f, 0.90f};
+static char g_luaEvalBuf[512] = "print('Hello from ImGui console!')";
+
+// ============================================================================
+// 3. Нативные мосты GTA SA / Arizona Mobile (dlsym + JNI + матрицы)
+// ============================================================================
+
+struct CVector {
+    float x, y, z;
+};
+
+typedef void (*FnNativeSendChat)(const char *text);
+typedef void (*FnAddChatMessage)(uint32_t color, const char *text);
+typedef void *(*FnFindPlayerPed)(int playerId);
+typedef bool (*FnCalcScreenCoors)(const CVector *in, CVector *out, float *outW, float *outH, bool checkMaxVisible, bool checkMinVisible);
+
+static FnNativeSendChat g_fnSendChat = nullptr;
+static FnAddChatMessage g_fnAddChatMessage = nullptr;
+static FnFindPlayerPed g_fnFindPlayerPed = nullptr;
+static FnCalcScreenCoors g_fnCalcScreenCoors = nullptr;
+
+static void ResolveGameSymbols() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        gRebindings = [NSMutableArray new];
-        _dyld_register_func_for_add_image(rebind_symbols_for_image);
+        void *handle = RTLD_DEFAULT;
+
+        const char *sendChatSyms[] = {
+            "_Z14NativeSendChatPKc",
+            "_ZN4Chat11SendMessageEPKc",
+            "NativeSendChat",
+            nullptr
+        };
+        for (int i = 0; sendChatSyms[i]; i++) {
+            void *sym = dlsym(handle, sendChatSyms[i]);
+            if (sym) { g_fnSendChat = (FnNativeSendChat)sym; break; }
+        }
+
+        const char *addChatSyms[] = {
+            "_Z14AddChatMessagejPKc",
+            "_ZN4Chat10AddMessageEjPKc",
+            "AddChatMessage",
+            nullptr
+        };
+        for (int i = 0; addChatSyms[i]; i++) {
+            void *sym = dlsym(handle, addChatSyms[i]);
+            if (sym) { g_fnAddChatMessage = (FnAddChatMessage)sym; break; }
+        }
+
+        g_fnFindPlayerPed = (FnFindPlayerPed)dlsym(handle, "_Z13FindPlayerPedi");
+        g_fnCalcScreenCoors = (FnCalcScreenCoors)dlsym(handle, "_ZN7CSprite15CalcScreenCoorsERK7CVectorPS0_PfS4_bb");
     });
-    struct Rebinding rb = {name, replacement, replaced};
-    [gRebindings addObject:[NSValue valueWithBytes:&rb objCType:@encode(struct Rebinding)]];
-    uint32_t c = _dyld_image_count();
-    for (uint32_t i = 0; i < c; i++) {
-        rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+}
+
+static bool ProjectWorldToScreen(float wx, float wy, float wz, float screenW, float screenH, float &sx, float &sy) {
+    ResolveGameSymbols();
+    if (g_fnCalcScreenCoors) {
+        CVector inVec{wx, wy, wz};
+        CVector outVec{0, 0, 0};
+        float w = 0, h = 0;
+        if (g_fnCalcScreenCoors(&inVec, &outVec, &w, &h, false, false) && outVec.z > 0.0f) {
+            sx = outVec.x;
+            sy = outVec.y;
+            return true;
+        }
     }
+    // Безопасный fallback относительно координат игрока, если CSprite недоступен
+    if (g_fnFindPlayerPed) {
+        uint8_t *ped = (uint8_t *)g_fnFindPlayerPed(-1);
+        if (ped) {
+            // В RenderWare CEntity matrix обычно по смещению 0x14 (указатель на RwMatrix)
+            uintptr_t matrixPtr = *(uintptr_t *)(ped + 0x14);
+            if (matrixPtr > 0x100000) {
+                float px = *(float *)(matrixPtr + 0x30);
+                float py = *(float *)(matrixPtr + 0x34);
+                float dx = wx - px;
+                float dy = wy - py;
+                float dist = sqrtf(dx * dx + dy * dy);
+                if (dist > 0.01f) {
+                    float angle = atan2f(dy, dx);
+                    float radius = fminf(screenW, screenH) * 0.35f;
+                    sx = screenW * 0.5f + cosf(angle) * radius;
+                    sy = screenH * 0.5f - sinf(angle) * radius;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
-static NSString *StripSampColors(NSString *input) {
-    if (!input || input.length == 0) return @"";
-    static NSRegularExpression *regex = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        regex = [NSRegularExpression regularExpressionWithPattern:@"\\{[0-9A-Fa-f]{6}\\}" options:0 error:nil];
-    });
-    return [regex stringByReplacingMatchesInString:input options:0 range:NSMakeRange(0, input.length) withTemplate:@""];
+static inline const char *SafeUTF8(NSString *s) {
+    if (!s) return "";
+    const char *c = [s UTF8String];
+    return c ? c : "";
 }
 
-@interface LuaCoroutineItem : NSObject
-@property (nonatomic, assign) lua_State *co;
-@property (nonatomic, assign) int ref;
-@property (nonatomic, assign) NSTimeInterval wakeTime;
-@property (nonatomic, copy) NSString *scriptName;
-@end
+static inline ImU32 ARGBToImU32(uint32_t argb) {
+    uint8_t a = (argb >> 24) & 0xFF;
+    uint8_t r = (argb >> 16) & 0xFF;
+    uint8_t g = (argb >> 8) & 0xFF;
+    uint8_t b = argb & 0xFF;
+    if (a == 0 && (r != 0 || g != 0 || b != 0)) a = 255;
+    return IM_COL32(r, g, b, a);
+}
 
-@implementation LuaCoroutineItem
-@end
+static UIWindow *GetActiveKeyWindow() {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive &&
+            [scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *win in ws.windows) {
+                if (win.isKeyWindow) return win;
+            }
+            if (ws.windows.firstObject) return ws.windows.firstObject;
+        }
+    }
+    return nil;
+}
 
-@interface LuaCommandItem : NSObject
-@property (nonatomic, copy) NSString *cmd;
-@property (nonatomic, assign) int callbackRef;
-@property (nonatomic, copy) NSString *scriptName;
-@property (nonatomic, assign) BOOL overrideServer;
-@end
-
-@implementation LuaCommandItem
-@end
-
-@interface PendingCommandItem : NSObject
-@property (nonatomic, copy) NSString *cmd;
-@property (nonatomic, copy) NSString *args;
-@property (nonatomic, assign) NSTimeInterval sentTime;
-@end
-
-@implementation PendingCommandItem
-@end
-
-@interface LuaEventItem : NSObject
-@property (nonatomic, copy) NSString *eventName;
-@property (nonatomic, assign) int callbackRef;
-@property (nonatomic, copy) NSString *scriptName;
-@end
-
-@implementation LuaEventItem
-@end
-
-@interface LoaderSettingsVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
-@end
+// ============================================================================
+// 4. Объявление LoaderEngine
+// ============================================================================
 
 @interface LoaderEngine : NSObject <UNUserNotificationCenterDelegate>
 @property (nonatomic, assign) lua_State *L;
-@property (nonatomic, copy) NSString *baseDir;
-@property (nonatomic, copy) NSString *configDir;
-@property (nonatomic, copy) NSString *statePath;
-@property (nonatomic, copy) NSString *serverCmdCachePath;
-@property (nonatomic, assign) BOOL gameStarted;
+@property (nonatomic, strong) NSRecursiveLock *luaLock;
 @property (nonatomic, assign) BOOL inGameSession;
-@property (nonatomic, copy) NSString *currentLoadingScript;
-
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *enabledScripts;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *scriptStatuses;
-@property (nonatomic, strong) NSMutableArray<NSString *> *discoveredScripts;
-@property (nonatomic, strong) NSMutableArray<LuaCoroutineItem *> *coroutines;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, LuaCommandItem *> *commands;
-@property (nonatomic, strong) NSMutableArray<LuaEventItem *> *eventHooks;
-
-@property (nonatomic, strong) NSMutableSet<NSString *> *knownServerCommands;
-@property (nonatomic, strong) NSMutableSet<NSString *> *confirmedLocalCommands;
-@property (nonatomic, strong) NSMutableArray<PendingCommandItem *> *pendingCommands;
-
-@property (nonatomic, strong) NSTimer *tickTimer;
-@property (nonatomic, assign) NSTimeInterval lastTick;
-
-@property (nonatomic, copy) NSString *accentHex;
-@property (nonatomic, assign) CGFloat uiAlpha;
-@property (nonatomic, assign) CGFloat cornerRadius;
-@property (nonatomic, assign) BOOL showFloatingBtn;
-@property (nonatomic, assign) BOOL showStartupBanner;
-
-@property (nonatomic, strong) UIView *statusBanner;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UIButton *floatingButton;
-@property (nonatomic, weak) LoaderSettingsVC *settingsVC;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *commands;
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *coroutines;
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *imguiFrameCallbacks;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *scriptStates;
+@property (nonatomic, strong) NSString *baseDir;
+@property (nonatomic, strong) NSString *scriptsDir;
+@property (nonatomic, strong) NSString *configDir;
+@property (nonatomic, assign) NSTimeInterval lastTickTime;
 
 + (instancetype)shared;
-- (void)bootStageOne;
-- (void)triggerStageTwoIfNeeded;
-- (void)scanScriptsOnly;
-- (void)loadAllEnabledScripts;
-- (void)reloadSingleScript:(NSString *)scriptName;
-- (void)unloadScriptResources:(NSString *)scriptName;
-- (void)setScript:(NSString *)scriptName enabled:(BOOL)enabled;
-- (void)saveState;
-- (void)registerKnownServerCommand:(NSString *)rawCmd persist:(BOOL)persist;
-- (void)resetServerCommandsCache;
+- (void)boot;
+- (void)reloadAllScripts;
+- (void)toggleScript:(NSString *)filename enabled:(BOOL)enabled;
+- (void)executeLuaString:(NSString *)code;
+- (void)appendLog:(int)level message:(NSString *)msg;
+
 - (BOOL)handleOutgoingInput:(NSString *)text;
-- (void)executeLuaCommand:(LuaCommandItem *)item args:(NSString *)args;
-- (BOOL)dispatchServerMessage:(uint32_t)color text:(NSString *)text outColor:(uint32_t *)outColor outText:(NSString **)outText;
-- (BOOL)dispatchShowDialog:(int)dialogId style:(int)style title:(NSString *)title btn1:(NSString *)btn1 btn2:(NSString *)btn2 text:(NSString *)text;
-- (void)showSettingsWindow;
-- (void)applyThemeToOverlay;
-- (UIColor *)currentAccentColor;
+- (BOOL)dispatchServerMessage:(uint32_t)color
+                         text:(NSString *)text
+                     outColor:(uint32_t *)outColor
+                      outText:(NSString **)outText;
+- (BOOL)dispatchShowDialog:(int)dialogId
+                     style:(int)style
+                     title:(NSString *)title
+                      btn1:(NSString *)btn1
+                      btn2:(NSString *)btn2
+                      text:(NSString *)text;
+- (void)tickFrame;
+- (void)renderImGuiFrames;
 @end
 
-static void (*orig_AddChatMessage)(uint32_t, const char *) = NULL;
-static void (*orig_ShowDialog)(int, int, const char *, const char *, const char *, const char *) = NULL;
-static void (*orig_AddClientCommand)(const char *, void *) = NULL;
+// ============================================================================
+// 5. Lua C API функции (SAMP, Async, JSON, INI, ImGui, Render, Tracers)
+// ============================================================================
 
-static void hooked_AddClientCommand(const char *cmd, void *handler) {
-    if (cmd) {
-        NSString *nsCmd = [NSString stringWithUTF8String:cmd];
-        if (nsCmd.length > 0) {
-            [[LoaderEngine shared] registerKnownServerCommand:nsCmd persist:NO];
-        }
+static int l_print(lua_State *L) {
+    int n = lua_gettop(L);
+    NSMutableArray *parts = [NSMutableArray arrayWithCapacity:n];
+    for (int i = 1; i <= n; i++) {
+        size_t len = 0;
+        const char *s = luaL_tolstring(L, i, &len);
+        [parts addObject:(s ? [NSString stringWithUTF8String:s] : @"nil")];
+        lua_pop(L, 1);
     }
-    if (orig_AddClientCommand) {
-        orig_AddClientCommand(cmd, handler);
-    }
+    NSString *joined = [parts componentsJoinedByString:@"\t"];
+    [[LoaderEngine shared] appendLog:1 message:joined];
+    return 0;
 }
 
-static void hooked_AddChatMessage(uint32_t color, const char *text) {
-    if (!text) return;
-    NSString *nsText = [NSString stringWithUTF8String:text] ?: @"";
-    uint32_t newColor = color;
-    NSString *newText = nsText;
-    BOOL allow = [[LoaderEngine shared] dispatchServerMessage:color text:nsText outColor:&newColor outText:&newText];
-    if (!allow) return;
-    if (orig_AddChatMessage) {
-        orig_AddChatMessage(newColor, [newText UTF8String]);
-    }
+static int l_isSampLoaded(lua_State *L) {
+    lua_pushboolean(L, [LoaderEngine shared].inGameSession ? 1 : 0);
+    return 1;
 }
 
-static void hooked_ShowDialog(int dialogId, int style, const char *title, const char *btn1, const char *btn2, const char *text) {
-    NSString *nsTitle = title ? ([NSString stringWithUTF8String:title] ?: @"") : @"";
-    NSString *nsB1 = btn1 ? ([NSString stringWithUTF8String:btn1] ?: @"") : @"";
-    NSString *nsB2 = btn2 ? ([NSString stringWithUTF8String:btn2] ?: @"") : @"";
-    NSString *nsText = text ? ([NSString stringWithUTF8String:text] ?: @"") : @"";
-    BOOL allow = [[LoaderEngine shared] dispatchShowDialog:dialogId style:style title:nsTitle btn1:nsB1 btn2:nsB2 text:nsText];
-    if (!allow) return;
-    if (orig_ShowDialog) {
-        orig_ShowDialog(dialogId, style, title, btn1, btn2, text);
+static int l_sampSendChat(lua_State *L) {
+    const char *msg = luaL_checkstring(L, 1);
+    ResolveGameSymbols();
+    if (g_fnSendChat) {
+        g_fnSendChat(msg);
     }
+    return 0;
 }
 
-static id NSObjectFromLua(lua_State *L, int idx) {
-    idx = lua_absindex(L, idx);
-    int t = lua_type(L, idx);
-    if (t == LUA_TNIL || t == LUA_TNONE) return [NSNull null];
-    if (t == LUA_TBOOLEAN) return @(lua_toboolean(L, idx) ? YES : NO);
-    if (t == LUA_TNUMBER) {
-        if (lua_isinteger(L, idx)) return @(lua_tointeger(L, idx));
-        return @(lua_tonumber(L, idx));
-    }
-    if (t == LUA_TSTRING) {
-        const char *s = lua_tostring(L, idx);
-        return [NSString stringWithUTF8String:s] ?: @"";
-    }
-    if (t == LUA_TTABLE) {
-        lua_Integer len = luaL_len(L, idx);
-        BOOL isArray = (len > 0);
-        lua_Integer count = 0;
-        lua_pushnil(L);
-        while (lua_next(L, idx) != 0) {
-            count++;
-            if (!lua_isinteger(L, -2)) {
-                isArray = NO;
-            } else {
-                lua_Integer k = lua_tointeger(L, -2);
-                if (k < 1 || k > len) isArray = NO;
-            }
-            lua_pop(L, 1);
-        }
-        if (count == 0) return @{};
-        if (isArray && count == len) {
-            NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)len];
-            for (lua_Integer i = 1; i <= len; i++) {
-                lua_geti(L, idx, i);
-                [arr addObject:NSObjectFromLua(L, -1)];
-                lua_pop(L, 1);
-            }
-            return arr;
-        } else {
-            NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-            lua_pushnil(L);
-            while (lua_next(L, idx) != 0) {
-                NSString *key = nil;
-                if (lua_type(L, -2) == LUA_TSTRING) {
-                    key = [NSString stringWithUTF8String:lua_tostring(L, -2)];
-                } else if (lua_isinteger(L, -2)) {
-                    key = [NSString stringWithFormat:@"%lld", lua_tointeger(L, -2)];
-                } else if (lua_type(L, -2) == LUA_TNUMBER) {
-                    key = [NSString stringWithFormat:@"%g", lua_tonumber(L, -2)];
-                }
-                if (key) {
-                    dict[key] = NSObjectFromLua(L, -1);
-                }
-                lua_pop(L, 1);
-            }
-            return dict;
-        }
-    }
-    return [NSNull null];
-}
-
-static void PushNSObjectToLua(lua_State *L, id obj) {
-    if (!obj || obj == [NSNull null]) {
-        lua_pushnil(L);
-    } else if ([obj isKindOfClass:[NSNumber class]]) {
-        NSNumber *num = (NSNumber *)obj;
-        if (strcmp([num objCType], @encode(BOOL)) == 0 || strcmp([num objCType], "c") == 0) {
-            lua_pushboolean(L, [num boolValue]);
-        } else if (CFNumberIsFloatType((CFNumberRef)num)) {
-            lua_pushnumber(L, [num doubleValue]);
-        } else {
-            lua_pushinteger(L, [num longLongValue]);
-        }
-    } else if ([obj isKindOfClass:[NSString class]]) {
-        lua_pushstring(L, [(NSString *)obj UTF8String]);
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        NSArray *arr = (NSArray *)obj;
-        lua_createtable(L, (int)arr.count, 0);
-        for (NSUInteger i = 0; i < arr.count; i++) {
-            PushNSObjectToLua(L, arr[i]);
-            lua_seti(L, -2, (lua_Integer)(i + 1));
-        }
-    } else if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)obj;
-        lua_createtable(L, 0, (int)dict.count);
-        for (id key in dict) {
-            NSString *kStr = [key description];
-            lua_pushstring(L, [kStr UTF8String]);
-            PushNSObjectToLua(L, dict[key]);
-            lua_settable(L, -3);
-        }
+static int l_sampAddChatMessage(lua_State *L) {
+    const char *msg = luaL_checkstring(L, 1);
+    uint32_t color = (uint32_t)luaL_optinteger(L, 2, 0xFFFFFFFF);
+    ResolveGameSymbols();
+    if (g_fnAddChatMessage) {
+        g_fnAddChatMessage(color, msg);
     } else {
-        lua_pushstring(L, [[obj description] UTF8String]);
-    }
-}
-
-static int l_json_encode(lua_State *L) {
-    luaL_checkany(L, 1);
-    id obj = NSObjectFromLua(L, 1);
-    if (![NSJSONSerialization isValidJSONObject:obj]) {
-        return luaL_error(L, "invalid table for json.encode");
-    }
-    NSError *err = nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:&err];
-    if (!data || err) {
-        return luaL_error(L, "json.encode failed");
-    }
-    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    lua_pushstring(L, [str UTF8String]);
-    return 1;
-}
-
-static int l_json_decode(lua_State *L) {
-    size_t len = 0;
-    const char *s = luaL_checklstring(L, 1, &len);
-    NSData *data = [NSData dataWithBytes:s length:len];
-    NSError *err = nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingAllowFragments error:&err];
-    if (err) {
-        lua_pushnil(L);
-        lua_pushstring(L, [[err localizedDescription] UTF8String]);
-        return 2;
-    }
-    PushNSObjectToLua(L, obj);
-    return 1;
-}
-
-static int l_inicfg_load(lua_State *L) {
-    id defObj = lua_istable(L, 1) ? NSObjectFromLua(L, 1) : @{};
-    const char *rawName = luaL_checkstring(L, 2);
-    NSString *fileName = [NSString stringWithUTF8String:rawName];
-    if (![fileName.pathExtension isEqualToString:@"json"]) {
-        fileName = [fileName stringByAppendingString:@".json"];
-    }
-    NSString *fullPath = [[LoaderEngine shared].configDir stringByAppendingPathComponent:fileName];
-    NSMutableDictionary *merged = [defObj isKindOfClass:[NSDictionary class]] ? [defObj mutableCopy] : [NSMutableDictionary dictionary];
-    NSData *data = [NSData dataWithContentsOfFile:fullPath];
-    if (data) {
-        id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if ([parsed isKindOfClass:[NSDictionary class]]) {
-            [merged addEntriesFromDictionary:parsed];
-        }
-    } else {
-        NSData *outData = [NSJSONSerialization dataWithJSONObject:merged options:NSJSONWritingPrettyPrinted error:nil];
-        [outData writeToFile:fullPath atomically:YES];
-    }
-    PushNSObjectToLua(L, merged);
-    return 1;
-}
-
-static int l_inicfg_save(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    const char *rawName = luaL_checkstring(L, 2);
-    NSString *fileName = [NSString stringWithUTF8String:rawName];
-    if (![fileName.pathExtension isEqualToString:@"json"]) {
-        fileName = [fileName stringByAppendingString:@".json"];
-    }
-    NSString *fullPath = [[LoaderEngine shared].configDir stringByAppendingPathComponent:fileName];
-    id obj = NSObjectFromLua(L, 1);
-    if (![NSJSONSerialization isValidJSONObject:obj]) {
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    NSData *outData = [NSJSONSerialization dataWithJSONObject:obj options:NSJSONWritingPrettyPrinted error:nil];
-    BOOL ok = [outData writeToFile:fullPath atomically:YES];
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-static int l_wait(lua_State *L) {
-    double ms = luaL_checknumber(L, 1);
-    int isMain = lua_pushthread(L);
-    lua_pop(L, 1);
-    if (isMain == 1) {
-        return luaL_error(L, "wait() must be called inside lua_thread.create");
-    }
-    lua_pushnumber(L, ms);
-    return lua_yield(L, 1);
-}
-
-static int l_lua_thread_create(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    int nargs = lua_gettop(L) - 1;
-    LoaderEngine *eng = [LoaderEngine shared];
-    lua_State *mainL = eng.L;
-
-    lua_State *co = lua_newthread(mainL);
-    int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);
-
-    lua_pushvalue(L, 1);
-    for (int i = 0; i < nargs; i++) {
-        lua_pushvalue(L, 2 + i);
-    }
-    lua_xmove(L, co, nargs + 1);
-
-    int nres = 0;
-    int status = AZ_LUA_RESUME(co, mainL, nargs, &nres);
-    if (status == LUA_YIELD) {
-        double ms = lua_gettop(co) > 0 ? lua_tonumber(co, -1) : 0.0;
-        lua_settop(co, 0);
-        LuaCoroutineItem *item = [LuaCoroutineItem new];
-        item.co = co;
-        item.ref = ref;
-        item.wakeTime = CACurrentMediaTime() + (ms / 1000.0);
-        item.scriptName = eng.currentLoadingScript ?: @"global";
-        [eng.coroutines addObject:item];
-    } else {
-        if (status != LUA_OK) {
-            const char *err = lua_tostring(co, -1);
-            NSLog(@"[42Loader] Coroutine error: %s", err ? err : "unknown");
-        }
-        luaL_unref(mainL, LUA_REGISTRYINDEX, ref);
+        [[LoaderEngine shared] appendLog:1 message:[NSString stringWithFormat:@"[CHAT] %s", msg]];
     }
     return 0;
 }
 
 static int l_sampRegisterChatCommand(lua_State *L) {
-    const char *rawCmd = luaL_checkstring(L, 1);
+    const char *cmd = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    BOOL overrideServer = lua_toboolean(L, 3) ? YES : NO;
-
-    NSString *cmd = [[NSString stringWithUTF8String:rawCmd] lowercaseString];
-    if ([cmd hasPrefix:@"/"]) {
-        cmd = [cmd substringFromIndex:1];
-    }
-    LoaderEngine *eng = [LoaderEngine shared];
-    LuaCommandItem *existing = eng.commands[cmd];
-    if (existing) {
-        luaL_unref(eng.L, LUA_REGISTRYINDEX, existing.callbackRef);
+    NSString *cmdName = [[NSString stringWithUTF8String:cmd] lowercaseString];
+    if ([cmdName hasPrefix:@"/"]) {
+        cmdName = [cmdName substringFromIndex:1];
     }
     lua_pushvalue(L, 2);
-    int ref = luaL_ref(eng.L, LUA_REGISTRYINDEX);
-    LuaCommandItem *item = [LuaCommandItem new];
-    item.cmd = cmd;
-    item.callbackRef = ref;
-    item.scriptName = eng.currentLoadingScript ?: @"global";
-    item.overrideServer = overrideServer;
-    eng.commands[cmd] = item;
-    return 0;
-}
-
-static int l_sampUnregisterChatCommand(lua_State *L) {
-    const char *rawCmd = luaL_checkstring(L, 1);
-    NSString *cmd = [[NSString stringWithUTF8String:rawCmd] lowercaseString];
-    if ([cmd hasPrefix:@"/"]) {
-        cmd = [cmd substringFromIndex:1];
-    }
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
     LoaderEngine *eng = [LoaderEngine shared];
-    LuaCommandItem *existing = eng.commands[cmd];
-    if (existing) {
-        luaL_unref(eng.L, LUA_REGISTRYINDEX, existing.callbackRef);
-        [eng.commands removeObjectForKey:cmd];
+    NSNumber *oldRef = eng.commands[cmdName];
+    if (oldRef) {
+        luaL_unref(L, LUA_REGISTRYINDEX, [oldRef intValue]);
     }
-    return 0;
-}
-
-static int l_isServerCommand(lua_State *L) {
-    const char *rawCmd = luaL_checkstring(L, 1);
-    NSString *cmd = [[NSString stringWithUTF8String:rawCmd] lowercaseString];
-    if ([cmd hasPrefix:@"/"]) {
-        cmd = [cmd substringFromIndex:1];
-    }
-    BOOL known = [[LoaderEngine shared].knownServerCommands containsObject:cmd];
-    lua_pushboolean(L, known ? 1 : 0);
-    return 1;
-}
-
-static int l_registerServerCommand(lua_State *L) {
-    const char *rawCmd = luaL_checkstring(L, 1);
-    NSString *cmd = [NSString stringWithUTF8String:rawCmd];
-    [[LoaderEngine shared] registerKnownServerCommand:cmd persist:YES];
-    return 0;
-}
-
-static int l_registerEvent(lua_State *L) {
-    const char *ev = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-    LoaderEngine *eng = [LoaderEngine shared];
-    lua_pushvalue(L, 2);
-    int ref = luaL_ref(eng.L, LUA_REGISTRYINDEX);
-    LuaEventItem *item = [LuaEventItem new];
-    item.eventName = [NSString stringWithUTF8String:ev];
-    item.callbackRef = ref;
-    item.scriptName = eng.currentLoadingScript ?: @"global";
-    [eng.eventHooks addObject:item];
-    return 0;
-}
-
-static int l_sampAddChatMessage(lua_State *L) {
-    const char *text = luaL_checkstring(L, 1);
-    uint32_t color = (uint32_t)luaL_optinteger(L, 2, 0xA855F7FF);
-    if (orig_AddChatMessage) {
-        orig_AddChatMessage(color, text);
-    } else {
-        NSString *msg = [NSString stringWithUTF8String:text] ?: @"";
-        dispatch_async(dispatch_get_main_queue(), ^{
-            LoaderEngine *eng = [LoaderEngine shared];
-            eng.statusLabel.text = [NSString stringWithFormat:@"42 • %@", msg];
-            eng.statusBanner.hidden = NO;
-        });
-    }
-    return 0;
-}
-
-static int l_sampSendChat(lua_State *L) {
-    const char *text = luaL_checkstring(L, 1);
-    void *sym = dlsym(RTLD_DEFAULT, "Java_com_arizona_game_GTASA_SendChatMessage");
-    if (sym) {
-        typedef void (*SendChatFn)(const char *);
-        ((SendChatFn)sym)(text);
-    }
-    return 0;
-}
-
-static int l_sampSendDialogResponse(lua_State *L) {
-    int dialogId = (int)luaL_checkinteger(L, 1);
-    int button = (int)luaL_checkinteger(L, 2);
-    int listitem = (int)luaL_optinteger(L, 3, 0);
-    const char *input = luaL_optstring(L, 4, "");
-    void *sym = dlsym(RTLD_DEFAULT, "SendDialogResponse");
-    if (!sym) sym = dlsym(RTLD_DEFAULT, "Java_com_arizona_game_GTASA_SendDialogResponse");
-    if (sym) {
-        typedef void (*DialogRespFn)(int, int, int, const char *);
-        ((DialogRespFn)sym)(dialogId, button, listitem, input);
-    }
-    return 0;
-}
-
-static int l_asyncHttpRequest(lua_State *L) {
-    const char *methodC = luaL_checkstring(L, 1);
-    const char *urlC = luaL_checkstring(L, 2);
-    NSDictionary *args = lua_istable(L, 3) ? (NSDictionary *)NSObjectFromLua(L, 3) : @{};
-
-    LoaderEngine *eng = [LoaderEngine shared];
-    int okRef = LUA_NOREF;
-    int errRef = LUA_NOREF;
-
-    if (lua_isfunction(L, 4)) {
-        lua_pushvalue(L, 4);
-        okRef = luaL_ref(eng.L, LUA_REGISTRYINDEX);
-    }
-    if (lua_isfunction(L, 5)) {
-        lua_pushvalue(L, 5);
-        errRef = luaL_ref(eng.L, LUA_REGISTRYINDEX);
-    }
-
-    NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:urlC]];
-    if (!url) {
-        if (okRef != LUA_NOREF) luaL_unref(eng.L, LUA_REGISTRYINDEX, okRef);
-        if (errRef != LUA_NOREF) luaL_unref(eng.L, LUA_REGISTRYINDEX, errRef);
-        return luaL_error(L, "invalid URL");
-    }
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = [[NSString stringWithUTF8String:methodC] uppercaseString];
-    req.timeoutInterval = args[@"timeout"] ? [args[@"timeout"] doubleValue] : 15.0;
-
-    NSDictionary *headers = args[@"headers"];
-    if ([headers isKindOfClass:[NSDictionary class]]) {
-        for (NSString *k in headers) {
-            [req setValue:[headers[k] description] forHTTPHeaderField:k];
-        }
-    }
-
-    id bodyObj = args[@"data"];
-    if (bodyObj) {
-        if ([bodyObj isKindOfClass:[NSString class]]) {
-            req.HTTPBody = [(NSString *)bodyObj dataUsingEncoding:NSUTF8StringEncoding];
-        } else if ([NSJSONSerialization isValidJSONObject:bodyObj]) {
-            req.HTTPBody = [NSJSONSerialization dataWithJSONObject:bodyObj options:0 error:nil];
-            if (![req valueForHTTPHeaderField:@"Content-Type"]) {
-                [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-            }
-        }
-    }
-
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            lua_State *mainL = [LoaderEngine shared].L;
-            if (!mainL) return;
-            if (error) {
-                if (errRef != LUA_NOREF) {
-                    lua_rawgeti(mainL, LUA_REGISTRYINDEX, errRef);
-                    lua_pushstring(mainL, [[error localizedDescription] UTF8String]);
-                    lua_pcall(mainL, 1, 0, 0);
-                }
-            } else if (okRef != LUA_NOREF) {
-                NSInteger statusCode = [(NSHTTPURLResponse *)response statusCode];
-                NSString *text = data ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
-                lua_rawgeti(mainL, LUA_REGISTRYINDEX, okRef);
-                lua_createtable(mainL, 0, 2);
-                lua_pushinteger(mainL, statusCode);
-                lua_setfield(mainL, -2, "status_code");
-                lua_pushstring(mainL, [text UTF8String]);
-                lua_setfield(mainL, -2, "text");
-                lua_pcall(mainL, 1, 0, 0);
-            }
-            if (okRef != LUA_NOREF) luaL_unref(mainL, LUA_REGISTRYINDEX, okRef);
-            if (errRef != LUA_NOREF) luaL_unref(mainL, LUA_REGISTRYINDEX, errRef);
-        });
-    }] resume];
-
-    return 0;
-}
-
-static int l_setClipboardText(lua_State *L) {
-    const char *text = luaL_checkstring(L, 1);
-    NSString *str = [NSString stringWithUTF8String:text] ?: @"";
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [UIPasteboard generalPasteboard].string = str;
-    });
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int l_getClipboardText(lua_State *L) {
-    NSString *str = [UIPasteboard generalPasteboard].string ?: @"";
-    lua_pushstring(L, [str UTF8String]);
-    return 1;
-}
-
-static int l_vibrate(lua_State *L) {
-    const char *styleC = luaL_optstring(L, 1, "medium");
-    NSString *style = [[NSString stringWithUTF8String:styleC] lowercaseString];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIImpactFeedbackStyle fbStyle = UIImpactFeedbackStyleMedium;
-        if ([style isEqualToString:@"light"]) fbStyle = UIImpactFeedbackStyleLight;
-        else if ([style isEqualToString:@"heavy"]) fbStyle = UIImpactFeedbackStyleHeavy;
-        else if (@available(iOS 13.0, *)) {
-            if ([style isEqualToString:@"soft"]) fbStyle = UIImpactFeedbackStyleSoft;
-            else if ([style isEqualToString:@"rigid"]) fbStyle = UIImpactFeedbackStyleRigid;
-        }
-        UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:fbStyle];
-        [gen prepare];
-        [gen impactOccurred];
-    });
-    return 0;
-}
-
-static int l_sendLocalNotification(lua_State *L) {
-    const char *titleC = luaL_checkstring(L, 1);
-    const char *bodyC = luaL_checkstring(L, 2);
-    double delay = luaL_optnumber(L, 3, 0.2);
-    if (delay < 0.1) delay = 0.1;
-
-    NSString *title = [NSString stringWithUTF8String:titleC] ?: @"42Loader";
-    NSString *body = [NSString stringWithUTF8String:bodyC] ?: @"";
-
-    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
-    content.title = title;
-    content.body = body;
-    content.sound = [UNNotificationSound defaultSound];
-
-    UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:delay repeats:NO];
-    NSString *identifier = [[NSUUID UUID] UUIDString];
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:trigger];
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
+    eng.commands[cmdName] = @(ref);
     return 0;
 }
 
@@ -747,394 +371,680 @@ static int l_getScreenResolution(lua_State *L) {
     return 2;
 }
 
-static int l_getScriptsCount(lua_State *L) {
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSInteger active = 0;
-    for (NSString *name in eng.discoveredScripts) {
-        if ([eng.enabledScripts[name] boolValue]) active++;
+static int l_getCharCoordinates(lua_State *L) {
+    ResolveGameSymbols();
+    if (g_fnFindPlayerPed) {
+        uint8_t *ped = (uint8_t *)g_fnFindPlayerPed(-1);
+        if (ped) {
+            uintptr_t matrixPtr = *(uintptr_t *)(ped + 0x14);
+            if (matrixPtr > 0x100000) {
+                float x = *(float *)(matrixPtr + 0x30);
+                float y = *(float *)(matrixPtr + 0x34);
+                float z = *(float *)(matrixPtr + 0x38);
+                lua_pushboolean(L, 1);
+                lua_pushnumber(L, x);
+                lua_pushnumber(L, y);
+                lua_pushnumber(L, z);
+                return 4;
+            }
+        }
     }
-    lua_pushinteger(L, eng.discoveredScripts.count);
-    lua_pushinteger(L, active);
-    return 2;
+    lua_pushboolean(L, 0);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    lua_pushnumber(L, 0.0);
+    return 4;
 }
 
-static int l_openLoaderSettings(lua_State *L) {
+static int l_convert3DCoordsToScreen(lua_State *L) {
+    float wx = (float)luaL_checknumber(L, 1);
+    float wy = (float)luaL_checknumber(L, 2);
+    float wz = (float)luaL_checknumber(L, 3);
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    float sx = 0, sy = 0;
+    bool ok = ProjectWorldToScreen(wx, wy, wz, bounds.size.width, bounds.size.height, sx, sy);
+    lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushnumber(L, sx);
+    lua_pushnumber(L, sy);
+    return 3;
+}
+
+// --- Корутины: az.thread.create / lua_thread.create + wait(ms) ---
+
+static int l_wait(lua_State *L) {
+    lua_Number ms = luaL_checknumber(L, 1);
+    NSTimeInterval wakeTime = CACurrentMediaTime() + (ms / 1000.0);
+    lua_pushnumber(L, wakeTime);
+    return lua_yield(L, 1);
+}
+
+static int l_threadCreate(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    lua_State *co = lua_newthread(L);
+    int threadRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pushvalue(L, 1);
+    lua_xmove(L, co, 1);
+
+    int status = lua_resume(co, L, 0, nullptr);
+    if (status == LUA_YIELD) {
+        NSTimeInterval wake = CACurrentMediaTime();
+        if (lua_gettop(co) >= 1 && lua_isnumber(co, -1)) {
+            wake = lua_tonumber(co, -1);
+            lua_pop(co, 1);
+        }
+        // Сохраняем threadRef и wakeTime в таблицу Registry
+        lua_newtable(L);
+        lua_pushinteger(L, threadRef);
+        lua_setfield(L, -2, "ref");
+        lua_pushnumber(L, wake);
+        lua_setfield(L, -2, "wake");
+        int entryRef = luaL_ref(L, LUA_REGISTRYINDEX);
+        [[LoaderEngine shared].coroutines addObject:@(entryRef)];
+    } else {
+        if (status != LUA_OK) {
+            const char *err = lua_tostring(co, -1);
+            [[LoaderEngine shared] appendLog:2 message:[NSString stringWithFormat:@"[Thread Error] %s", err ? err : "unknown"]];
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, threadRef);
+    }
+    return 0;
+}
+
+// --- Буфер обмена, вибрация, уведомления, HTTP, память ---
+
+static int l_setClipboardText(lua_State *L) {
+    const char *txt = luaL_checkstring(L, 1);
+    [UIPasteboard generalPasteboard].string = [NSString stringWithUTF8String:txt];
+    return 0;
+}
+
+static int l_getClipboardText(lua_State *L) {
+    NSString *s = [UIPasteboard generalPasteboard].string ?: @"";
+    lua_pushstring(L, SafeUTF8(s));
+    return 1;
+}
+
+static int l_vibrate(lua_State *L) {
+    int style = (int)luaL_optinteger(L, 1, 1);
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[LoaderEngine shared] showSettingsWindow];
+        UIImpactFeedbackStyle fbStyle = UIImpactFeedbackStyleMedium;
+        if (style == 0) fbStyle = UIImpactFeedbackStyleLight;
+        else if (style >= 2) fbStyle = UIImpactFeedbackStyleHeavy;
+        UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:fbStyle];
+        [gen prepare];
+        [gen impactOccurred];
     });
     return 0;
 }
 
-static int luaopen_cjson_shim(lua_State *L) {
-    lua_createtable(L, 0, 2);
-    lua_pushcfunction(L, l_json_encode);
-    lua_setfield(L, -2, "encode");
-    lua_pushcfunction(L, l_json_decode);
-    lua_setfield(L, -2, "decode");
-    return 1;
-}
+static int l_notify(lua_State *L) {
+    const char *title = luaL_checkstring(L, 1);
+    const char *body = luaL_checkstring(L, 2);
+    double delay = luaL_optnumber(L, 3, 0.5);
+    if (delay < 0.1) delay = 0.1;
 
-static int luaopen_inicfg_shim(lua_State *L) {
-    lua_createtable(L, 0, 2);
-    lua_pushcfunction(L, l_inicfg_load);
-    lua_setfield(L, -2, "load");
-    lua_pushcfunction(L, l_inicfg_save);
-    lua_setfield(L, -2, "save");
-    return 1;
-}
+    NSString *nsTitle = [NSString stringWithUTF8String:title];
+    NSString *nsBody = [NSString stringWithUTF8String:body];
 
-@implementation LoaderSettingsVC {
-    UISegmentedControl *_tabs;
-    UITableView *_tableView;
-    UIView *_appearanceView;
-    UITextField *_cmdInput;
-    UISlider *_alphaSlider;
-    UISlider *_radiusSlider;
-    UISwitch *_floatBtnSwitch;
-    UISwitch *_bannerSwitch;
-    UIButton *_resetCmdCacheBtn;
-}
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+                          completionHandler:^(BOOL granted, NSError * _Nullable error) {
+        if (!granted || error) return;
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = nsTitle;
+        content.body = nsBody;
+        content.sound = [UNNotificationSound defaultSound];
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    LoaderEngine *eng = [LoaderEngine shared];
-    UIColor *accent = [eng currentAccentColor];
-
-    self.view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-
-    UIView *card = [[UIView alloc] init];
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.backgroundColor = [[UIColor colorWithRed:0.07 green:0.04 blue:0.12 alpha:1.0] colorWithAlphaComponent:eng.uiAlpha];
-    card.layer.cornerRadius = eng.cornerRadius;
-    card.layer.borderWidth = 1.2;
-    card.layer.borderColor = [accent colorWithAlphaComponent:0.65].CGColor;
-    card.clipsToBounds = YES;
-    [self.view addSubview:card];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [card.widthAnchor constraintEqualToConstant:440],
-        [card.heightAnchor constraintEqualToConstant:325]
-    ]];
-
-    UILabel *titleLbl = [[UILabel alloc] init];
-    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    titleLbl.text = @"42Loader • Arizona iOS";
-    titleLbl.font = [UIFont boldSystemFontOfSize:16];
-    titleLbl.textColor = [UIColor whiteColor];
-    [card addSubview:titleLbl];
-
-    UIButton *reloadAllBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    reloadAllBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [reloadAllBtn setTitle:@"Reload All" forState:UIControlStateNormal];
-    [reloadAllBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    reloadAllBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    reloadAllBtn.backgroundColor = accent;
-    reloadAllBtn.layer.cornerRadius = 8;
-    [reloadAllBtn addTarget:self action:@selector(onReloadAll) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:reloadAllBtn];
-
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-    [closeBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [closeBtn addTarget:self action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:closeBtn];
-
-    _tabs = [[UISegmentedControl alloc] initWithItems:@[@"Скрипты", @"Интерфейс"]];
-    _tabs.translatesAutoresizingMaskIntoConstraints = NO;
-    _tabs.selectedSegmentIndex = 0;
-    _tabs.selectedSegmentTintColor = accent;
-    [_tabs setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateNormal];
-    [_tabs addTarget:self action:@selector(onTabChanged) forControlEvents:UIControlEventValueChanged];
-    [card addSubview:_tabs];
-
-    _tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
-    _tableView.translatesAutoresizingMaskIntoConstraints = NO;
-    _tableView.backgroundColor = [UIColor clearColor];
-    _tableView.separatorColor = [[UIColor whiteColor] colorWithAlphaComponent:0.08];
-    _tableView.dataSource = self;
-    _tableView.delegate = self;
-    [card addSubview:_tableView];
-
-    _cmdInput = [[UITextField alloc] init];
-    _cmdInput.translatesAutoresizingMaskIntoConstraints = NO;
-    _cmdInput.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.08];
-    _cmdInput.textColor = [UIColor whiteColor];
-    _cmdInput.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    _cmdInput.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Выполнить команду (например /luahelp)..." attributes:@{NSForegroundColorAttributeName: [UIColor grayColor]}];
-    _cmdInput.layer.cornerRadius = 8;
-    _cmdInput.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 30)];
-    _cmdInput.leftViewMode = UITextFieldViewModeAlways;
-    _cmdInput.returnKeyType = UIReturnKeySend;
-    _cmdInput.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    _cmdInput.autocorrectionType = UITextAutocorrectionTypeNo;
-    _cmdInput.delegate = self;
-    [card addSubview:_cmdInput];
-
-    _appearanceView = [[UIView alloc] init];
-    _appearanceView.translatesAutoresizingMaskIntoConstraints = NO;
-    _appearanceView.hidden = YES;
-    [card addSubview:_appearanceView];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
-        [titleLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-
-        [closeBtn.centerYAnchor constraintEqualToAnchor:titleLbl.centerYAnchor],
-        [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [closeBtn.widthAnchor constraintEqualToConstant:30],
-
-        [reloadAllBtn.centerYAnchor constraintEqualToAnchor:titleLbl.centerYAnchor],
-        [reloadAllBtn.trailingAnchor constraintEqualToAnchor:closeBtn.leadingAnchor constant:-8],
-        [reloadAllBtn.widthAnchor constraintEqualToConstant:82],
-        [reloadAllBtn.heightAnchor constraintEqualToConstant:26],
-
-        [_tabs.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:10],
-        [_tabs.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_tabs.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [_tabs.heightAnchor constraintEqualToConstant:28],
-
-        [_cmdInput.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
-        [_cmdInput.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_cmdInput.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [_cmdInput.heightAnchor constraintEqualToConstant:32],
-
-        [_tableView.topAnchor constraintEqualToAnchor:_tabs.bottomAnchor constant:8],
-        [_tableView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:8],
-        [_tableView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-8],
-        [_tableView.bottomAnchor constraintEqualToAnchor:_cmdInput.topAnchor constant:-8],
-
-        [_appearanceView.topAnchor constraintEqualToAnchor:_tabs.bottomAnchor constant:8],
-        [_appearanceView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_appearanceView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [_appearanceView.bottomAnchor constraintEqualToAnchor:_cmdInput.topAnchor constant:-8]
-    ]];
-
-    [self buildAppearanceControls];
-}
-
-- (void)buildAppearanceControls {
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSArray<NSString *> *palette = @[@"#8B5CF6", @"#C026D3", @"#6366F1", @"#EC4899"];
-    UILabel *colorLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 2, 140, 24)];
-    colorLbl.text = @"Цвет акцента:";
-    colorLbl.textColor = [UIColor whiteColor];
-    colorLbl.font = [UIFont systemFontOfSize:13];
-    [_appearanceView addSubview:colorLbl];
-
-    for (NSUInteger i = 0; i < palette.count; i++) {
-        UIButton *swatch = [UIButton buttonWithType:UIButtonTypeCustom];
-        swatch.frame = CGRectMake(150 + i * 36, 0, 26, 26);
-        swatch.layer.cornerRadius = 13;
-        swatch.backgroundColor = [self colorFromHex:palette[i]];
-        swatch.layer.borderWidth = [eng.accentHex isEqualToString:palette[i]] ? 2.5 : 0.0;
-        swatch.layer.borderColor = [UIColor whiteColor].CGColor;
-        swatch.tag = (NSInteger)i;
-        [swatch addTarget:self action:@selector(onSelectAccent:) forControlEvents:UIControlEventTouchUpInside];
-        [_appearanceView addSubview:swatch];
-    }
-
-    UILabel *alphaLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 34, 140, 24)];
-    alphaLbl.text = @"Прозрачность:";
-    alphaLbl.textColor = [UIColor whiteColor];
-    alphaLbl.font = [UIFont systemFontOfSize:13];
-    [_appearanceView addSubview:alphaLbl];
-
-    _alphaSlider = [[UISlider alloc] initWithFrame:CGRectMake(150, 32, 240, 26)];
-    _alphaSlider.minimumValue = 0.65f;
-    _alphaSlider.maximumValue = 1.0f;
-    _alphaSlider.value = (float)eng.uiAlpha;
-    _alphaSlider.tintColor = [eng currentAccentColor];
-    [_alphaSlider addTarget:self action:@selector(onAppearanceChanged) forControlEvents:UIControlEventValueChanged];
-    [_appearanceView addSubview:_alphaSlider];
-
-    UILabel *radLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 66, 140, 24)];
-    radLbl.text = @"Скругление углов:";
-    radLbl.textColor = [UIColor whiteColor];
-    radLbl.font = [UIFont systemFontOfSize:13];
-    [_appearanceView addSubview:radLbl];
-
-    _radiusSlider = [[UISlider alloc] initWithFrame:CGRectMake(150, 64, 240, 26)];
-    _radiusSlider.minimumValue = 6.0f;
-    _radiusSlider.maximumValue = 24.0f;
-    _radiusSlider.value = (float)eng.cornerRadius;
-    _radiusSlider.tintColor = [eng currentAccentColor];
-    [_radiusSlider addTarget:self action:@selector(onAppearanceChanged) forControlEvents:UIControlEventValueChanged];
-    [_appearanceView addSubview:_radiusSlider];
-
-    UILabel *btnLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, 220, 24)];
-    btnLbl.text = @"Кнопка 42 поверх экрана:";
-    btnLbl.textColor = [UIColor whiteColor];
-    btnLbl.font = [UIFont systemFontOfSize:13];
-    [_appearanceView addSubview:btnLbl];
-
-    _floatBtnSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(340, 96, 51, 31)];
-    _floatBtnSwitch.on = eng.showFloatingBtn;
-    _floatBtnSwitch.onTintColor = [eng currentAccentColor];
-    [_floatBtnSwitch addTarget:self action:@selector(onAppearanceChanged) forControlEvents:UIControlEventValueChanged];
-    [_appearanceView addSubview:_floatBtnSwitch];
-
-    UILabel *banLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 134, 240, 24)];
-    banLbl.text = @"Баннер статуса при запуске:";
-    banLbl.textColor = [UIColor whiteColor];
-    banLbl.font = [UIFont systemFontOfSize:13];
-    [_appearanceView addSubview:banLbl];
-
-    _bannerSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(340, 130, 51, 31)];
-    _bannerSwitch.on = eng.showStartupBanner;
-    _bannerSwitch.onTintColor = [eng currentAccentColor];
-    [_bannerSwitch addTarget:self action:@selector(onAppearanceChanged) forControlEvents:UIControlEventValueChanged];
-    [_appearanceView addSubview:_bannerSwitch];
-
-    _resetCmdCacheBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _resetCmdCacheBtn.frame = CGRectMake(0, 170, 392, 28);
-    [_resetCmdCacheBtn setTitle:@"Сбросить кэш команд сервера" forState:UIControlStateNormal];
-    [_resetCmdCacheBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _resetCmdCacheBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    _resetCmdCacheBtn.backgroundColor = [[eng currentAccentColor] colorWithAlphaComponent:0.35];
-    _resetCmdCacheBtn.layer.cornerRadius = 8;
-    [_resetCmdCacheBtn addTarget:self action:@selector(onResetServerCommands) forControlEvents:UIControlEventTouchUpInside];
-    [_appearanceView addSubview:_resetCmdCacheBtn];
-}
-
-- (void)onResetServerCommands {
-    [[LoaderEngine shared] resetServerCommandsCache];
-    [_resetCmdCacheBtn setTitle:@"Кэш команд сервера сброшен ✓" forState:UIControlStateNormal];
-}
-
-- (UIColor *)colorFromHex:(NSString *)hex {
-    unsigned rgb = 0;
-    NSScanner *scanner = [NSScanner scannerWithString:hex];
-    if ([hex hasPrefix:@"#"]) [scanner setScanLocation:1];
-    [scanner scanHexInt:&rgb];
-    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
-                           green:((rgb >> 8) & 0xFF) / 255.0
-                            blue:(rgb & 0xFF) / 255.0
-                           alpha:1.0];
-}
-
-- (void)onSelectAccent:(UIButton *)sender {
-    NSArray<NSString *> *palette = @[@"#8B5CF6", @"#C026D3", @"#6366F1", @"#EC4899"];
-    LoaderEngine *eng = [LoaderEngine shared];
-    eng.accentHex = palette[(NSUInteger)sender.tag];
-    [eng saveState];
-    [eng applyThemeToOverlay];
-    [self dismissViewControllerAnimated:NO completion:^{
-        [[LoaderEngine shared] showSettingsWindow];
+        UNTimeIntervalNotificationTrigger *trigger =
+            [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:delay repeats:NO];
+        NSString *ident = [[NSUUID UUID] UUIDString];
+        UNNotificationRequest *req =
+            [UNNotificationRequest requestWithIdentifier:ident content:content trigger:trigger];
+        [center addNotificationRequest:req withCompletionHandler:nil];
     }];
+    return 0;
 }
 
-- (void)onAppearanceChanged {
-    LoaderEngine *eng = [LoaderEngine shared];
-    eng.uiAlpha = _alphaSlider.value;
-    eng.cornerRadius = _radiusSlider.value;
-    eng.showFloatingBtn = _floatBtnSwitch.on;
-    eng.showStartupBanner = _bannerSwitch.on;
-    [eng saveState];
-    [eng applyThemeToOverlay];
+static int l_getLoaderMemory(lua_State *L) {
+    LoaderMemoryStats st = GetLoaderMemoryStats();
+    lua_pushinteger(L, (lua_Integer)st.totalBytes);
+    lua_pushnumber(L, (double)st.totalBytes / (1024.0 * 1024.0));
+    return 2;
 }
 
-- (void)onTabChanged {
-    BOOL isScripts = (_tabs.selectedSegmentIndex == 0);
-    _tableView.hidden = !isScripts;
-    _appearanceView.hidden = isScripts;
-}
+static int l_asyncHttpRequest(lua_State *L) {
+    const char *method = luaL_checkstring(L, 1);
+    const char *urlStr = luaL_checkstring(L, 2);
+    NSString *nsMethod = [[NSString stringWithUTF8String:method] uppercaseString];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:urlStr]];
+    if (!url) return 0;
 
-- (void)onReloadAll {
-    LoaderEngine *eng = [LoaderEngine shared];
-    [eng scanScriptsOnly];
-    [eng loadAllEnabledScripts];
-    [_tableView reloadData];
-}
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = nsMethod;
+    req.timeoutInterval = 15.0;
 
-- (void)onClose {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "data");
+        if (lua_isstring(L, -1)) {
+            NSString *bodyStr = [NSString stringWithUTF8String:lua_tostring(L, -1)];
+            req.HTTPBody = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        lua_pop(L, 1);
 
-- (BOOL)textFieldShouldReturn:(UITextField *)textField {
-    NSString *txt = textField.text;
-    textField.text = @"";
-    [textField resignFirstResponder];
-    if (txt.length > 0) {
-        BOOL handled = [[LoaderEngine shared] handleOutgoingInput:txt];
-        if (!handled) {
-            void *sym = dlsym(RTLD_DEFAULT, "Java_com_arizona_game_GTASA_SendChatMessage");
-            if (sym) {
-                typedef void (*SendChatFn)(const char *);
-                ((SendChatFn)sym)([txt UTF8String]);
+        lua_getfield(L, 3, "headers");
+        if (lua_istable(L, -1)) {
+            lua_pushnil(L);
+            while (lua_next(L, -2) != 0) {
+                if (lua_isstring(L, -2) && lua_isstring(L, -1)) {
+                    NSString *k = [NSString stringWithUTF8String:lua_tostring(L, -2)];
+                    NSString *v = [NSString stringWithUTF8String:lua_tostring(L, -1)];
+                    [req setValue:v forHTTPHeaderField:k];
+                }
+                lua_pop(L, 1);
             }
         }
-        [_tableView reloadData];
+        lua_pop(L, 1);
     }
-    return YES;
+
+    int okRef = LUA_NOREF;
+    int errRef = LUA_NOREF;
+    if (lua_isfunction(L, 4)) {
+        lua_pushvalue(L, 4);
+        okRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    if (lua_isfunction(L, 5)) {
+        lua_pushvalue(L, 5);
+        errRef = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                     completionHandler:^(NSData * _Nullable data,
+                                                         NSURLResponse * _Nullable response,
+                                                         NSError * _Nullable error) {
+        LoaderEngine *eng = [LoaderEngine shared];
+        [eng.luaLock lock];
+        lua_State *LS = eng.L;
+        if (LS) {
+            int top = lua_gettop(LS);
+            if (error) {
+                if (errRef != LUA_NOREF) {
+                    lua_rawgeti(LS, LUA_REGISTRYINDEX, errRef);
+                    lua_pushstring(LS, SafeUTF8(error.localizedDescription));
+                    if (lua_pcall(LS, 1, 0, 0) != LUA_OK) {
+                        [eng appendLog:2 message:[NSString stringWithFormat:@"[HTTP ErrCb] %s", lua_tostring(LS, -1)]];
+                    }
+                }
+            } else if (okRef != LUA_NOREF) {
+                NSInteger statusCode = [(NSHTTPURLResponse *)response statusCode];
+                NSString *respStr = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+                if (!respStr) respStr = @"";
+                lua_rawgeti(LS, LUA_REGISTRYINDEX, okRef);
+                lua_newtable(LS);
+                lua_pushinteger(LS, statusCode);
+                lua_setfield(LS, -2, "status_code");
+                lua_pushstring(LS, SafeUTF8(respStr));
+                lua_setfield(LS, -2, "text");
+                if (lua_pcall(LS, 1, 0, 0) != LUA_OK) {
+                    [eng appendLog:2 message:[NSString stringWithFormat:@"[HTTP OkCb] %s", lua_tostring(LS, -1)]];
+                }
+            }
+            if (okRef != LUA_NOREF) luaL_unref(LS, LUA_REGISTRYINDEX, okRef);
+            if (errRef != LUA_NOREF) luaL_unref(LS, LUA_REGISTRYINDEX, errRef);
+            lua_settop(LS, top);
+        }
+        [eng.luaLock unlock];
+    }] resume];
+
+    return 0;
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (NSInteger)[LoaderEngine shared].discoveredScripts.count;
+// --- JSON (cjson / encodeJson / decodeJson) ---
+
+static id LuaTableToObjC(lua_State *L, int idx) {
+    idx = lua_absindex(L, idx);
+    int type = lua_type(L, idx);
+    if (type == LUA_TBOOLEAN) return @(lua_toboolean(L, idx) != 0);
+    if (type == LUA_TNUMBER) return @(lua_tonumber(L, idx));
+    if (type == LUA_TSTRING) return [NSString stringWithUTF8String:lua_tostring(L, idx)] ?: @"";
+    if (type != LUA_TTABLE) return [NSNull null];
+
+    // Проверяем, является ли таблица массивом 1..N
+    lua_Integer maxIdx = 0;
+    lua_Integer count = 0;
+    bool isArray = true;
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        if (lua_type(L, -2) == LUA_TNUMBER && lua_isinteger(L, -2)) {
+            lua_Integer k = lua_tointeger(L, -2);
+            if (k > 0) {
+                if (k > maxIdx) maxIdx = k;
+                count++;
+            } else {
+                isArray = false;
+            }
+        } else {
+            isArray = false;
+        }
+        lua_pop(L, 1);
+    }
+
+    if (isArray && count > 0 && maxIdx == count) {
+        NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+        for (lua_Integer i = 1; i <= count; i++) {
+            lua_geti(L, idx, i);
+            [arr addObject:LuaTableToObjC(L, -1)];
+            lua_pop(L, 1);
+        }
+        return arr;
+    }
+
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        const char *kStr = lua_tostring(L, -2);
+        if (kStr) {
+            dict[[NSString stringWithUTF8String:kStr]] = LuaTableToObjC(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+    return dict;
 }
 
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return 44.0;
+static void PushObjCToLua(lua_State *L, id obj) {
+    if (!obj || obj == [NSNull null]) {
+        lua_pushnil(L);
+    } else if ([obj isKindOfClass:[NSNumber class]]) {
+        NSNumber *num = (NSNumber *)obj;
+        if (strcmp([num objCType], @encode(BOOL)) == 0 ||
+            strcmp([num objCType], @encode(char)) == 0) {
+            lua_pushboolean(L, [num boolValue] ? 1 : 0);
+        } else {
+            lua_pushnumber(L, [num doubleValue]);
+        }
+    } else if ([obj isKindOfClass:[NSString class]]) {
+        lua_pushstring(L, SafeUTF8((NSString *)obj));
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *arr = (NSArray *)obj;
+        lua_createtable(L, (int)arr.count, 0);
+        for (NSUInteger i = 0; i < arr.count; i++) {
+            PushObjCToLua(L, arr[i]);
+            lua_seti(L, -2, (lua_Integer)(i + 1));
+        }
+    } else if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)obj;
+        lua_createtable(L, 0, (int)dict.count);
+        for (id key in dict) {
+            PushObjCToLua(L, dict[key]);
+            lua_setfield(L, -2, SafeUTF8([key description]));
+        }
+    } else {
+        lua_pushnil(L);
+    }
 }
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSString *scriptName = eng.discoveredScripts[(NSUInteger)indexPath.row];
-    BOOL enabled = [eng.enabledScripts[scriptName] boolValue];
-    NSString *st = eng.scriptStatuses[scriptName] ?: (enabled ? @"Ready" : @"Off");
-
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.backgroundColor = [UIColor clearColor];
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    cell.textLabel.text = scriptName;
-    cell.textLabel.textColor = [UIColor whiteColor];
-    cell.textLabel.font = [UIFont boldSystemFontOfSize:13];
-    cell.detailTextLabel.text = st;
-    cell.detailTextLabel.textColor = [st hasPrefix:@"Err"] ? [UIColor systemRedColor] : [UIColor lightGrayColor];
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:11];
-
-    UIView *accessory = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 120, 34)];
-
-    UIButton *reloadBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    reloadBtn.frame = CGRectMake(0, 3, 56, 28);
-    [reloadBtn setTitle:@"Reload" forState:UIControlStateNormal];
-    [reloadBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    reloadBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    reloadBtn.backgroundColor = [[eng currentAccentColor] colorWithAlphaComponent:0.45];
-    reloadBtn.layer.cornerRadius = 6;
-    reloadBtn.tag = indexPath.row;
-    [reloadBtn addTarget:self action:@selector(onReloadRow:) forControlEvents:UIControlEventTouchUpInside];
-    [accessory addSubview:reloadBtn];
-
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(64, 1, 51, 31)];
-    sw.on = enabled;
-    sw.onTintColor = [eng currentAccentColor];
-    sw.tag = indexPath.row;
-    [sw addTarget:self action:@selector(onToggleRow:) forControlEvents:UIControlEventValueChanged];
-    [accessory addSubview:sw];
-
-    cell.accessoryView = accessory;
-    return cell;
+static int l_encodeJson(lua_State *L) {
+    id obj = LuaTableToObjC(L, 1);
+    if (![NSJSONSerialization isValidJSONObject:obj]) {
+        lua_pushstring(L, "{}");
+        return 1;
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+    NSString *str = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"{}";
+    lua_pushstring(L, SafeUTF8(str));
+    return 1;
 }
 
-- (void)onReloadRow:(UIButton *)sender {
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSString *scriptName = eng.discoveredScripts[(NSUInteger)sender.tag];
-    [eng reloadSingleScript:scriptName];
-    [_tableView reloadData];
+static int l_decodeJson(lua_State *L) {
+    const char *raw = luaL_checkstring(L, 1);
+    NSData *data = [[NSString stringWithUTF8String:raw] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) {
+        lua_pushnil(L);
+        return 1;
+    }
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
+    PushObjCToLua(L, obj);
+    return 1;
 }
 
-- (void)onToggleRow:(UISwitch *)sender {
-    LoaderEngine *eng = [LoaderEngine shared];
-    NSString *scriptName = eng.discoveredScripts[(NSUInteger)sender.tag];
-    [eng setScript:scriptName enabled:sender.on];
-    [_tableView reloadData];
+// --- Render & Tracers Lua API ---
+
+static int l_renderDrawLine(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::LINE;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.x2 = (float)luaL_checknumber(L, 3);
+    cmd.y2 = (float)luaL_checknumber(L, 4);
+    cmd.thickness = (float)luaL_optnumber(L, 5, 1.5);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 6, 0xFFFFFFFF));
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
 }
 
-@end
+static int l_renderDrawBox(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::BOX_FILLED;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.x2 = cmd.x1 + (float)luaL_checknumber(L, 3);
+    cmd.y2 = cmd.y1 + (float)luaL_checknumber(L, 4);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 5, 0x80000000));
+    cmd.rounding = (float)luaL_optnumber(L, 6, 0.0);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
+}
+
+static int l_renderDrawBoxBorder(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::BOX;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.x2 = cmd.x1 + (float)luaL_checknumber(L, 3);
+    cmd.y2 = cmd.y1 + (float)luaL_checknumber(L, 4);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 5, 0xFFFFFFFF));
+    cmd.thickness = (float)luaL_optnumber(L, 6, 1.5);
+    cmd.rounding = (float)luaL_optnumber(L, 7, 0.0);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
+}
+
+static int l_renderDrawCircle(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::CIRCLE;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.radius = (float)luaL_checknumber(L, 3);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 4, 0xFFFFFFFF));
+    cmd.thickness = (float)luaL_optnumber(L, 5, 1.5);
+    cmd.segments = (int)luaL_optinteger(L, 6, 32);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
+}
+
+static int l_renderDrawCircleFilled(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::CIRCLE_FILLED;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.radius = (float)luaL_checknumber(L, 3);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 4, 0xFFFFFFFF));
+    cmd.segments = (int)luaL_optinteger(L, 5, 32);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
+}
+
+static int l_renderDrawText(lua_State *L) {
+    DrawCommandItem cmd;
+    cmd.type = DrawCommandItem::TEXT;
+    cmd.x1 = (float)luaL_checknumber(L, 1);
+    cmd.y1 = (float)luaL_checknumber(L, 2);
+    cmd.text = luaL_checkstring(L, 3);
+    cmd.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 4, 0xFFFFFFFF));
+    cmd.shadow = lua_isnone(L, 5) ? true : (lua_toboolean(L, 5) != 0);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_frameDrawCommands.push_back(std::move(cmd));
+    return 0;
+}
+
+static int l_renderAddTracer(lua_State *L) {
+    std::string id = luaL_checkstring(L, 1);
+    TracerItem tr;
+    tr.id = id;
+    tr.is3D = false;
+    tr.x1 = (float)luaL_checknumber(L, 2);
+    tr.y1 = (float)luaL_checknumber(L, 3);
+    tr.x2 = (float)luaL_checknumber(L, 4);
+    tr.y2 = (float)luaL_checknumber(L, 5);
+    tr.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 6, 0xFFA855F7));
+    tr.thickness = (float)luaL_optnumber(L, 7, 2.0);
+    tr.label = luaL_optstring(L, 8, "");
+
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    for (auto &existing : g_tracers) {
+        if (existing.id == id) {
+            existing = std::move(tr);
+            return 0;
+        }
+    }
+    g_tracers.push_back(std::move(tr));
+    return 0;
+}
+
+static int l_renderAddWorldTracer(lua_State *L) {
+    std::string id = luaL_checkstring(L, 1);
+    TracerItem tr;
+    tr.id = id;
+    tr.is3D = true;
+    tr.wx = (float)luaL_checknumber(L, 2);
+    tr.wy = (float)luaL_checknumber(L, 3);
+    tr.wz = (float)luaL_checknumber(L, 4);
+    tr.color = ARGBToImU32((uint32_t)luaL_optinteger(L, 5, 0xFFA855F7));
+    tr.thickness = (float)luaL_optnumber(L, 6, 2.0);
+    tr.label = luaL_optstring(L, 7, "");
+
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    for (auto &existing : g_tracers) {
+        if (existing.id == id) {
+            existing = std::move(tr);
+            return 0;
+        }
+    }
+    g_tracers.push_back(std::move(tr));
+    return 0;
+}
+
+static int l_renderRemoveTracer(lua_State *L) {
+    std::string id = luaL_checkstring(L, 1);
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_tracers.erase(
+        std::remove_if(g_tracers.begin(), g_tracers.end(),
+                       [&](const TracerItem &t) { return t.id == id; }),
+        g_tracers.end());
+    return 0;
+}
+
+static int l_renderClearTracers(lua_State *L) {
+    (void)L;
+    std::lock_guard<std::mutex> lock(g_renderMutex);
+    g_tracers.clear();
+    return 0;
+}
+
+static int l_renderSetTracersEnabled(lua_State *L) {
+    g_tracersEnabled = (lua_toboolean(L, 1) != 0);
+    return 0;
+}
+
+// --- ImGui Lua Bindings (mimgui-совместимый API) ---
+
+static int l_imguiOnFrame(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    lua_newtable(L);
+    lua_pushvalue(L, 1);
+    lua_setfield(L, -2, "cond");
+    lua_pushvalue(L, 2);
+    lua_setfield(L, -2, "draw");
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    [[LoaderEngine shared].imguiFrameCallbacks addObject:@(ref)];
+    return 0;
+}
+
+static int l_imguiBegin(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    bool hasOpenArg = !lua_isnoneornil(L, 2);
+    bool pOpen = hasOpenArg ? (lua_toboolean(L, 2) != 0) : true;
+    ImGuiWindowFlags flags = (ImGuiWindowFlags)luaL_optinteger(L, 3, 0);
+
+    bool visible = ImGui::Begin(name, hasOpenArg ? &pOpen : nullptr, flags);
+    lua_pushboolean(L, visible ? 1 : 0);
+    if (hasOpenArg) {
+        lua_pushboolean(L, pOpen ? 1 : 0);
+        return 2;
+    }
+    return 1;
+}
+
+static int l_imguiEnd(lua_State *L) {
+    (void)L;
+    ImGui::End();
+    return 0;
+}
+
+static int l_imguiText(lua_State *L) {
+    const char *txt = luaL_checkstring(L, 1);
+    ImGui::TextUnformatted(txt);
+    return 0;
+}
+
+static int l_imguiTextColored(lua_State *L) {
+    float r = (float)luaL_checknumber(L, 1);
+    float g = (float)luaL_checknumber(L, 2);
+    float b = (float)luaL_checknumber(L, 3);
+    float a = (float)luaL_checknumber(L, 4);
+    const char *txt = luaL_checkstring(L, 5);
+    ImGui::TextColored(ImVec4(r, g, b, a), "%s", txt);
+    return 0;
+}
+
+static int l_imguiTextWrapped(lua_State *L) {
+    const char *txt = luaL_checkstring(L, 1);
+    ImGui::TextWrapped("%s", txt);
+    return 0;
+}
+
+static int l_imguiButton(lua_State *L) {
+    const char *label = luaL_checkstring(L, 1);
+    float w = (float)luaL_optnumber(L, 2, 0.0);
+    float h = (float)luaL_optnumber(L, 3, 0.0);
+    lua_pushboolean(L, ImGui::Button(label, ImVec2(w, h)) ? 1 : 0);
+    return 1;
+}
+
+static int l_imguiCheckbox(lua_State *L) {
+    const char *label = luaL_checkstring(L, 1);
+    bool val = lua_toboolean(L, 2) != 0;
+    bool changed = ImGui::Checkbox(label, &val);
+    lua_pushboolean(L, changed ? 1 : 0);
+    lua_pushboolean(L, val ? 1 : 0);
+    return 2;
+}
+
+static int l_imguiSliderFloat(lua_State *L) {
+    const char *label = luaL_checkstring(L, 1);
+    float val = (float)luaL_checknumber(L, 2);
+    float vMin = (float)luaL_checknumber(L, 3);
+    float vMax = (float)luaL_checknumber(L, 4);
+    const char *fmt = luaL_optstring(L, 5, "%.2f");
+    bool changed = ImGui::SliderFloat(label, &val, vMin, vMax, fmt);
+    lua_pushboolean(L, changed ? 1 : 0);
+    lua_pushnumber(L, val);
+    return 2;
+}
+
+static int l_imguiSliderInt(lua_State *L) {
+    const char *label = luaL_checkstring(L, 1);
+    int val = (int)luaL_checkinteger(L, 2);
+    int vMin = (int)luaL_checkinteger(L, 3);
+    int vMax = (int)luaL_checkinteger(L, 4);
+    bool changed = ImGui::SliderInt(label, &val, vMin, vMax);
+    lua_pushboolean(L, changed ? 1 : 0);
+    lua_pushinteger(L, val);
+    return 2;
+}
+
+static int l_imguiInputText(lua_State *L) {
+    const char *label = luaL_checkstring(L, 1);
+    const char *initStr = luaL_optstring(L, 2, "");
+    size_t maxLen = (size_t)luaL_optinteger(L, 3, 256);
+    if (maxLen < 64) maxLen = 64;
+    if (maxLen > 4096) maxLen = 4096;
+
+    std::vector<char> buf(maxLen, '\0');
+    strncpy(buf.data(), initStr, maxLen - 1);
+    bool changed = ImGui::InputText(label, buf.data(), maxLen);
+    lua_pushboolean(L, changed ? 1 : 0);
+    lua_pushstring(L, buf.data());
+    return 2;
+}
+
+static int l_imguiSameLine(lua_State *L) {
+    float offset = (float)luaL_optnumber(L, 1, 0.0);
+    float spacing = (float)luaL_optnumber(L, 2, -1.0);
+    ImGui::SameLine(offset, spacing);
+    return 0;
+}
+
+static int l_imguiSeparator(lua_State *L) {
+    (void)L;
+    ImGui::Separator();
+    return 0;
+}
+
+static int l_imguiSpacing(lua_State *L) {
+    (void)L;
+    ImGui::Spacing();
+    return 0;
+}
+
+static int l_imguiSetNextWindowSize(lua_State *L) {
+    float w = (float)luaL_checknumber(L, 1);
+    float h = (float)luaL_checknumber(L, 2);
+    ImGuiCond cond = (ImGuiCond)luaL_optinteger(L, 3, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
+    return 0;
+}
+
+static int l_imguiSetNextWindowPos(lua_State *L) {
+    float x = (float)luaL_checknumber(L, 1);
+    float y = (float)luaL_checknumber(L, 2);
+    ImGuiCond cond = (ImGuiCond)luaL_optinteger(L, 3, ImGuiCond_FirstUseEver);
+    float px = (float)luaL_optnumber(L, 4, 0.0);
+    float py = (float)luaL_optnumber(L, 5, 0.0);
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond, ImVec2(px, py));
+    return 0;
+}
+
+static int l_imguiBeginChild(lua_State *L) {
+    const char *id = luaL_checkstring(L, 1);
+    float w = (float)luaL_optnumber(L, 2, 0.0);
+    float h = (float)luaL_optnumber(L, 3, 0.0);
+    bool border = lua_toboolean(L, 4) != 0;
+    lua_pushboolean(L, ImGui::BeginChild(id, ImVec2(w, h), border) ? 1 : 0);
+    return 1;
+}
+
+static int l_imguiEndChild(lua_State *L) {
+    (void)L;
+    ImGui::EndChild();
+    return 0;
+}
+
+static int l_imguiGetIO(lua_State *L) {
+    ImGuiIO &io = ImGui::GetIO();
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushnumber(L, io.DisplaySize.x);
+    lua_setfield(L, -2, "x");
+    lua_pushnumber(L, io.DisplaySize.y);
+    lua_setfield(L, -2, "y");
+    lua_setfield(L, -2, "DisplaySize");
+    lua_pushnumber(L, io.Framerate);
+    lua_setfield(L, -2, "Framerate");
+    lua_pushboolean(L, io.WantCaptureMouse ? 1 : 0);
+    lua_setfield(L, -2, "WantCaptureMouse");
+    return 1;
+}
+
+// ============================================================================
+// 6. Реализация LoaderEngine
+// ============================================================================
 
 @implementation LoaderEngine
 
@@ -1148,505 +1058,390 @@ static int luaopen_inicfg_shim(lua_State *L) {
 }
 
 - (instancetype)init {
-    self = [super init];
-    if (self) {
+    if (self = [super init]) {
+        _luaLock = [[NSRecursiveLock alloc] init];
+        _commands = [NSMutableDictionary dictionary];
+        _coroutines = [NSMutableArray array];
+        _imguiFrameCallbacks = [NSMutableArray array];
+        _scriptStates = [NSMutableDictionary dictionary];
+        _lastTickTime = CACurrentMediaTime();
+
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         _baseDir = [docs stringByAppendingPathComponent:@"arizonaloader"];
+        _scriptsDir = [_baseDir stringByAppendingPathComponent:@"scripts"];
         _configDir = [_baseDir stringByAppendingPathComponent:@"config"];
-        _statePath = [_baseDir stringByAppendingPathComponent:@"loader_state.json"];
-        _serverCmdCachePath = [_configDir stringByAppendingPathComponent:@"server_commands.json"];
 
         NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:_baseDir withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm createDirectoryAtPath:_scriptsDir withIntermediateDirectories:YES attributes:nil error:nil];
         [fm createDirectoryAtPath:_configDir withIntermediateDirectories:YES attributes:nil error:nil];
-        [fm createDirectoryAtPath:[_baseDir stringByAppendingPathComponent:@"lib"] withIntermediateDirectories:YES attributes:nil error:nil];
 
-        _enabledScripts = [NSMutableDictionary dictionary];
-        _scriptStatuses = [NSMutableDictionary dictionary];
-        _discoveredScripts = [NSMutableArray array];
-        _coroutines = [NSMutableArray array];
-        _commands = [NSMutableDictionary dictionary];
-        _eventHooks = [NSMutableArray array];
-
-        _knownServerCommands = [NSMutableSet set];
-        _confirmedLocalCommands = [NSMutableSet set];
-        _pendingCommands = [NSMutableArray array];
-
-        _accentHex = @"#8B5CF6";
-        _uiAlpha = 0.94;
-        _cornerRadius = 16.0;
-        _showFloatingBtn = YES;
-        _showStartupBanner = YES;
-
-        [self seedDefaultServerCommands];
-        [self loadServerCommandsCache];
-        [self loadState];
+        [self loadScriptStates];
+        [UNUserNotificationCenter currentNotificationCenter].delegate = self;
     }
     return self;
 }
 
-- (void)seedDefaultServerCommands {
-    NSArray<NSString *> *builtins = @[
-        @"q", @"quit", @"save", @"rs", @"interior", @"fpslimit",
-        @"pagesize", @"timestamp", @"headmove", @"dl", @"mem",
-        @"audiomsg", @"nametagstatus", @"ctd", @"rcon"
-    ];
-    [_knownServerCommands addObjectsFromArray:builtins];
+- (NSString *)stateFilePath {
+    return [self.configDir stringByAppendingPathComponent:@"scripts_state.json"];
 }
 
-- (void)loadServerCommandsCache {
-    NSData *data = [NSData dataWithContentsOfFile:_serverCmdCachePath];
+- (void)loadScriptStates {
+    NSData *data = [NSData dataWithContentsOfFile:[self stateFilePath]];
     if (!data) return;
-    NSArray *arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if ([arr isKindOfClass:[NSArray class]]) {
-        for (id item in arr) {
-            if ([item isKindOfClass:[NSString class]]) {
-                [_knownServerCommands addObject:[(NSString *)item lowercaseString]];
-            }
-        }
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        [self.scriptStates addEntriesFromDictionary:obj];
     }
 }
 
-- (void)saveServerCommandsCache {
-    NSArray *sorted = [[_knownServerCommands allObjects] sortedArrayUsingSelector:@selector(compare:)];
-    NSData *data = [NSJSONSerialization dataWithJSONObject:sorted options:NSJSONWritingPrettyPrinted error:nil];
-    [data writeToFile:_serverCmdCachePath atomically:YES];
-}
-
-- (void)registerKnownServerCommand:(NSString *)rawCmd persist:(BOOL)persist {
-    if (!rawCmd || rawCmd.length == 0) return;
-    NSString *cmd = [rawCmd lowercaseString];
-    if ([cmd hasPrefix:@"/"]) cmd = [cmd substringFromIndex:1];
-    if (cmd.length == 0) return;
-
-    [_knownServerCommands addObject:cmd];
-    [_confirmedLocalCommands removeObject:cmd];
-    if (persist) {
-        [self saveServerCommandsCache];
+- (void)saveScriptStates {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:self.scriptStates options:NSJSONWritingPrettyPrinted error:nil];
+    if (data) {
+        [data writeToFile:[self stateFilePath] atomically:YES];
     }
 }
 
-- (void)resetServerCommandsCache {
-    [_knownServerCommands removeAllObjects];
-    [_confirmedLocalCommands removeAllObjects];
-    [_pendingCommands removeAllObjects];
-    [self seedDefaultServerCommands];
-    [self saveServerCommandsCache];
-}
-
-- (void)loadState {
-    NSData *data = [NSData dataWithContentsOfFile:_statePath];
-    if (!data) return;
-    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![dict isKindOfClass:[NSDictionary class]]) return;
-    if ([dict[@"scripts"] isKindOfClass:[NSDictionary class]]) {
-        [_enabledScripts addEntriesFromDictionary:dict[@"scripts"]];
+- (void)appendLog:(int)level message:(NSString *)msg {
+    if (!msg) return;
+    NSLog(@"[ArizonaLoader] %@", msg);
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_logs.size() >= kMaxLogs) {
+        g_logs.erase(g_logs.begin());
     }
-    if ([dict[@"accentHex"] isKindOfClass:[NSString class]]) _accentHex = dict[@"accentHex"];
-    if (dict[@"uiAlpha"]) _uiAlpha = [dict[@"uiAlpha"] doubleValue];
-    if (dict[@"cornerRadius"]) _cornerRadius = [dict[@"cornerRadius"] doubleValue];
-    if (dict[@"showFloatingBtn"]) _showFloatingBtn = [dict[@"showFloatingBtn"] boolValue];
-    if (dict[@"showStartupBanner"]) _showStartupBanner = [dict[@"showStartupBanner"] boolValue];
+    g_logs.push_back({level, std::string(SafeUTF8(msg))});
 }
 
-- (void)saveState {
-    NSDictionary *dict = @{
-        @"scripts": _enabledScripts,
-        @"accentHex": _accentHex,
-        @"uiAlpha": @(_uiAlpha),
-        @"cornerRadius": @(_cornerRadius),
-        @"showFloatingBtn": @(_showFloatingBtn),
-        @"showStartupBanner": @(_showStartupBanner)
-    };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:NSJSONWritingPrettyPrinted error:nil];
-    [data writeToFile:_statePath atomically:YES];
+- (void)boot {
+    [self reloadAllScripts];
 }
 
-- (UIColor *)currentAccentColor {
-    unsigned rgb = 0;
-    NSScanner *scanner = [NSScanner scannerWithString:_accentHex];
-    if ([_accentHex hasPrefix:@"#"]) [scanner setScanLocation:1];
-    [scanner scanHexInt:&rgb];
-    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
-                           green:((rgb >> 8) & 0xFF) / 255.0
-                            blue:(rgb & 0xFF) / 255.0
-                           alpha:1.0];
+- (void)registerLuaAPI:(lua_State *)L {
+    // Базовые глобальные функции
+    lua_register(L, "print", l_print);
+    lua_register(L, "wait", l_wait);
+    lua_register(L, "isSampLoaded", l_isSampLoaded);
+    lua_register(L, "isSampAvailable", l_isSampLoaded);
+    lua_register(L, "sampSendChat", l_sampSendChat);
+    lua_register(L, "sampAddChatMessage", l_sampAddChatMessage);
+    lua_register(L, "sampRegisterChatCommand", l_sampRegisterChatCommand);
+    lua_register(L, "getScreenResolution", l_getScreenResolution);
+    lua_register(L, "getCharCoordinates", l_getCharCoordinates);
+    lua_register(L, "convert3DCoordsToScreen", l_convert3DCoordsToScreen);
+    lua_register(L, "setClipboardText", l_setClipboardText);
+    lua_register(L, "getClipboardText", l_getClipboardText);
+    lua_register(L, "asyncHttpRequest", l_asyncHttpRequest);
+    lua_register(L, "encodeJson", l_encodeJson);
+    lua_register(L, "decodeJson", l_decodeJson);
+
+    // cjson таблица
+    lua_newtable(L);
+    lua_pushcfunction(L, l_encodeJson);
+    lua_setfield(L, -2, "encode");
+    lua_pushcfunction(L, l_decodeJson);
+    lua_setfield(L, -2, "decode");
+    lua_setglobal(L, "cjson");
+
+    // lua_thread таблица
+    lua_newtable(L);
+    lua_pushcfunction(L, l_threadCreate);
+    lua_setfield(L, -2, "create");
+    lua_setglobal(L, "lua_thread");
+
+    // az таблица
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushcfunction(L, l_threadCreate);
+    lua_setfield(L, -2, "create");
+    lua_setfield(L, -2, "thread");
+    lua_pushcfunction(L, l_vibrate);
+    lua_setfield(L, -2, "vibrate");
+    lua_pushcfunction(L, l_notify);
+    lua_setfield(L, -2, "notify");
+    lua_pushcfunction(L, l_getLoaderMemory);
+    lua_setfield(L, -2, "getLoaderMemory");
+    lua_setglobal(L, "az");
+
+    // render таблица (рендер + трейсеры)
+    lua_newtable(L);
+    lua_pushcfunction(L, l_renderDrawLine);
+    lua_setfield(L, -2, "drawLine");
+    lua_pushcfunction(L, l_renderDrawBox);
+    lua_setfield(L, -2, "drawBox");
+    lua_pushcfunction(L, l_renderDrawBoxBorder);
+    lua_setfield(L, -2, "drawBoxBorder");
+    lua_pushcfunction(L, l_renderDrawCircle);
+    lua_setfield(L, -2, "drawCircle");
+    lua_pushcfunction(L, l_renderDrawCircleFilled);
+    lua_setfield(L, -2, "drawCircleFilled");
+    lua_pushcfunction(L, l_renderDrawText);
+    lua_setfield(L, -2, "drawText");
+    lua_pushcfunction(L, l_renderAddTracer);
+    lua_setfield(L, -2, "addTracer");
+    lua_pushcfunction(L, l_renderAddWorldTracer);
+    lua_setfield(L, -2, "addWorldTracer");
+    lua_pushcfunction(L, l_renderRemoveTracer);
+    lua_setfield(L, -2, "removeTracer");
+    lua_pushcfunction(L, l_renderClearTracers);
+    lua_setfield(L, -2, "clearTracers");
+    lua_pushcfunction(L, l_renderSetTracersEnabled);
+    lua_setfield(L, -2, "setTracersEnabled");
+    lua_setglobal(L, "render");
+
+    // imgui таблица
+    lua_newtable(L);
+    lua_pushcfunction(L, l_imguiOnFrame);
+    lua_setfield(L, -2, "OnFrame");
+    lua_pushcfunction(L, l_imguiBegin);
+    lua_setfield(L, -2, "Begin");
+    lua_pushcfunction(L, l_imguiEnd);
+    lua_setfield(L, -2, "End");
+    lua_pushcfunction(L, l_imguiText);
+    lua_setfield(L, -2, "Text");
+    lua_pushcfunction(L, l_imguiTextColored);
+    lua_setfield(L, -2, "TextColored");
+    lua_pushcfunction(L, l_imguiTextWrapped);
+    lua_setfield(L, -2, "TextWrapped");
+    lua_pushcfunction(L, l_imguiButton);
+    lua_setfield(L, -2, "Button");
+    lua_pushcfunction(L, l_imguiCheckbox);
+    lua_setfield(L, -2, "Checkbox");
+    lua_pushcfunction(L, l_imguiSliderFloat);
+    lua_setfield(L, -2, "SliderFloat");
+    lua_pushcfunction(L, l_imguiSliderInt);
+    lua_setfield(L, -2, "SliderInt");
+    lua_pushcfunction(L, l_imguiInputText);
+    lua_setfield(L, -2, "InputText");
+    lua_pushcfunction(L, l_imguiSameLine);
+    lua_setfield(L, -2, "SameLine");
+    lua_pushcfunction(L, l_imguiSeparator);
+    lua_setfield(L, -2, "Separator");
+    lua_pushcfunction(L, l_imguiSpacing);
+    lua_setfield(L, -2, "Spacing");
+    lua_pushcfunction(L, l_imguiSetNextWindowSize);
+    lua_setfield(L, -2, "SetNextWindowSize");
+    lua_pushcfunction(L, l_imguiSetNextWindowPos);
+    lua_setfield(L, -2, "SetNextWindowPos");
+    lua_pushcfunction(L, l_imguiBeginChild);
+    lua_setfield(L, -2, "BeginChild");
+    lua_pushcfunction(L, l_imguiEndChild);
+    lua_setfield(L, -2, "EndChild");
+    lua_pushcfunction(L, l_imguiGetIO);
+    lua_setfield(L, -2, "GetIO");
+
+    // Флаги ImGuiWindowFlags / ImGuiCond
+    lua_newtable(L);
+    lua_pushinteger(L, ImGuiWindowFlags_NoTitleBar); lua_setfield(L, -2, "NoTitleBar");
+    lua_pushinteger(L, ImGuiWindowFlags_NoResize); lua_setfield(L, -2, "NoResize");
+    lua_pushinteger(L, ImGuiWindowFlags_NoMove); lua_setfield(L, -2, "NoMove");
+    lua_pushinteger(L, ImGuiWindowFlags_NoCollapse); lua_setfield(L, -2, "NoCollapse");
+    lua_pushinteger(L, ImGuiWindowFlags_AlwaysAutoResize); lua_setfield(L, -2, "AlwaysAutoResize");
+    lua_pushinteger(L, ImGuiWindowFlags_NoBackground); lua_setfield(L, -2, "NoBackground");
+    lua_setfield(L, -2, "WindowFlags");
+
+    lua_newtable(L);
+    lua_pushinteger(L, ImGuiCond_Always); lua_setfield(L, -2, "Always");
+    lua_pushinteger(L, ImGuiCond_Once); lua_setfield(L, -2, "Once");
+    lua_pushinteger(L, ImGuiCond_FirstUseEver); lua_setfield(L, -2, "FirstUseEver");
+    lua_setfield(L, -2, "Cond");
+
+    lua_setglobal(L, "imgui");
+
+    // Настраиваем package.path для require(...) в папке scripts/lib
+    NSString *pkgSetup = [NSString stringWithFormat:
+        @"package.path = '%@/?.lua;%@/lib/?.lua;' .. package.path\n"
+         "inicfg = {\n"
+         "  load = function(def, fname)\n"
+         "    local p = '%@/' .. (fname or 'settings.ini')\n"
+         "    local f = io.open(p, 'r')\n"
+         "    if not f then return def or {} end\n"
+         "    local res = def or {}\n"
+         "    local sec = 'main'\n"
+         "    for line in f:lines() do\n"
+         "      local s = line:match('^%%[(.-)%%]$')\n"
+         "      if s then sec = s; res[sec] = res[sec] or {} else\n"
+         "        local k, v = line:match('^([^=]+)=(.*)$')\n"
+         "        if k and v then\n"
+         "          k = k:match('^%%s*(.-)%%s*$'); v = v:match('^%%s*(.-)%%s*$')\n"
+         "          if v == 'true' then v = true elseif v == 'false' then v = false elseif tonumber(v) then v = tonumber(v) end\n"
+         "          res[sec] = res[sec] or {}; res[sec][k] = v\n"
+         "        end\n"
+         "      end\n"
+         "    end\n"
+         "    f:close(); return res\n"
+         "  end,\n"
+         "  save = function(tbl, fname)\n"
+         "    local p = '%@/' .. (fname or 'settings.ini')\n"
+         "    local f = io.open(p, 'w')\n"
+         "    if not f then return false end\n"
+         "    for sec, kv in pairs(tbl) do\n"
+         "      if type(kv) == 'table' then\n"
+         "        f:write('[' .. tostring(sec) .. ']\\n')\n"
+         "        for k, v in pairs(kv) do f:write(tostring(k) .. '=' .. tostring(v) .. '\\n') end\n"
+         "      end\n"
+         "    end\n"
+         "    f:close(); return true\n"
+         "  end\n"
+         "}",
+        self.scriptsDir, self.scriptsDir, self.configDir, self.configDir];
+
+    if (luaL_dostring(L, SafeUTF8(pkgSetup)) != LUA_OK) {
+        [self appendLog:2 message:[NSString stringWithFormat:@"[Bootstrap Error] %s", lua_tostring(L, -1)]];
+        lua_pop(L, 1);
+    }
 }
 
-- (void)initLuaVM {
-    if (_L) lua_close(_L);
-    _L = luaL_newstate();
+- (void)reloadAllScripts {
+    [self.luaLock lock];
+
+    [self.commands removeAllObjects];
+    [self.coroutines removeAllObjects];
+    [self.imguiFrameCallbacks removeAllObjects];
+
+    if (_L) {
+        lua_close(_L);
+        _L = nullptr;
+        g_luaTrackedBytes.store(0, std::memory_order_relaxed);
+    }
+
+    _L = lua_newstate(LoaderLuaAlloc, nullptr);
     luaL_openlibs(_L);
+    [self registerLuaAPI:_L];
 
-    NSString *pkgPaths = [NSString stringWithFormat:@"%@/?.lua;%@/lib/?.lua", _baseDir, _baseDir];
-    lua_getglobal(_L, "package");
-    lua_pushstring(_L, [pkgPaths UTF8String]);
-    lua_setfield(_L, -2, "path");
-    lua_getfield(_L, -1, "preload");
-    lua_pushcfunction(_L, luaopen_cjson_shim);
-    lua_setfield(_L, -2, "cjson");
-    lua_pushcfunction(_L, luaopen_cjson_shim);
-    lua_setfield(_L, -2, "json");
-    lua_pushcfunction(_L, luaopen_inicfg_shim);
-    lua_setfield(_L, -2, "inicfg");
-    lua_pop(_L, 2);
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *files = [[fm contentsOfDirectoryAtPath:self.scriptsDir error:nil]
+                                  sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 
-    luaopen_cjson_shim(_L);
-    lua_setglobal(_L, "json");
+    int loadedCount = 0;
+    for (NSString *file in files) {
+        if (![file.pathExtension.lowercaseString isEqualToString:@"lua"]) continue;
 
-    luaopen_inicfg_shim(_L);
-    lua_setglobal(_L, "inicfg");
+        NSNumber *enabledObj = self.scriptStates[file];
+        BOOL enabled = (enabledObj == nil) ? YES : [enabledObj boolValue];
+        if (!enabled) continue;
 
-    lua_createtable(_L, 0, 1);
-    lua_pushcfunction(_L, l_lua_thread_create);
-    lua_setfield(_L, -2, "create");
-    lua_setglobal(_L, "lua_thread");
-
-    lua_register(_L, "wait", l_wait);
-    lua_register(_L, "sampRegisterChatCommand", l_sampRegisterChatCommand);
-    lua_register(_L, "sampUnregisterChatCommand", l_sampUnregisterChatCommand);
-    lua_register(_L, "isServerCommand", l_isServerCommand);
-    lua_register(_L, "registerServerCommand", l_registerServerCommand);
-    lua_register(_L, "registerEvent", l_registerEvent);
-    lua_register(_L, "sampAddChatMessage", l_sampAddChatMessage);
-    lua_register(_L, "sampSendChat", l_sampSendChat);
-    lua_register(_L, "sampSendDialogResponse", l_sampSendDialogResponse);
-    lua_register(_L, "asyncHttpRequest", l_asyncHttpRequest);
-    lua_register(_L, "setClipboardText", l_setClipboardText);
-    lua_register(_L, "getClipboardText", l_getClipboardText);
-    lua_register(_L, "vibrate", l_vibrate);
-    lua_register(_L, "sendLocalNotification", l_sendLocalNotification);
-    lua_register(_L, "getScreenResolution", l_getScreenResolution);
-    lua_register(_L, "getScriptsCount", l_getScriptsCount);
-    lua_register(_L, "openLoaderSettings", l_openLoaderSettings);
-
-    const char *bootstrap =
-        "function httpRequest(method, url, args)\n"
-        "  local done, res, err = false, nil, nil\n"
-        "  asyncHttpRequest(method, url, args or {},\n"
-        "    function(r) res = r; done = true end,\n"
-        "    function(e) err = e; done = true end)\n"
-        "  while not done do wait(10) end\n"
-        "  return res, err\n"
-        "end\n";
-    luaL_dostring(_L, bootstrap);
-}
-
-- (void)scanScriptsOnly {
-    [_discoveredScripts removeAllObjects];
-    NSArray<NSString *> *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:_baseDir error:nil];
-    NSArray<NSString *> *sorted = [items sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-    for (NSString *file in sorted) {
-        if ([file.pathExtension.lowercaseString isEqualToString:@"lua"]) {
-            [_discoveredScripts addObject:file];
-            if (_enabledScripts[file] == nil) {
-                _enabledScripts[file] = @YES;
-            }
-            if (!_gameStarted) {
-                _scriptStatuses[file] = [_enabledScripts[file] boolValue] ? @"Ожидает запуска игры" : @"Отключён";
-            }
-        }
-    }
-    [self saveState];
-}
-
-- (void)bootStageOne {
-    [self scanScriptsOnly];
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
-    center.delegate = self;
-    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge) completionHandler:^(BOOL granted, NSError *error) {}];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self setupOverlayUI];
-        NSInteger active = 0;
-        for (NSString *s in self.discoveredScripts) {
-            if ([self.enabledScripts[s] boolValue]) active++;
-        }
-        self.statusLabel.text = [NSString stringWithFormat:@"42Loader • Найдено скриптов: %lu (активно: %ld)",
-                                 (unsigned long)self.discoveredScripts.count, (long)active];
-        self.statusBanner.hidden = !self.showStartupBanner;
-    });
-}
-
-- (void)triggerStageTwoIfNeeded {
-    if (_gameStarted) return;
-    _gameStarted = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.text = @"42Loader • Загрузка скриптов...";
-        self.statusBanner.hidden = !self.showStartupBanner;
-        [self loadAllEnabledScripts];
-    });
-}
-
-- (void)unloadScriptResources:(NSString *)scriptName {
-    if (!_L) return;
-    NSMutableArray *keepCo = [NSMutableArray array];
-    for (LuaCoroutineItem *item in _coroutines) {
-        if ([item.scriptName isEqualToString:scriptName]) {
-            luaL_unref(_L, LUA_REGISTRYINDEX, item.ref);
+        NSString *fullPath = [self.scriptsDir stringByAppendingPathComponent:file];
+        int top = lua_gettop(_L);
+        if (luaL_dofile(_L, SafeUTF8(fullPath)) != LUA_OK) {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[%@] %s", file, err ? err : "error"]];
         } else {
-            [keepCo addObject:item];
-        }
-    }
-    _coroutines = keepCo;
-
-    NSArray<NSString *> *cmdKeys = [_commands allKeys];
-    for (NSString *k in cmdKeys) {
-        LuaCommandItem *c = _commands[k];
-        if ([c.scriptName isEqualToString:scriptName]) {
-            luaL_unref(_L, LUA_REGISTRYINDEX, c.callbackRef);
-            [_commands removeObjectForKey:k];
-        }
-    }
-
-    NSMutableArray *keepEv = [NSMutableArray array];
-    for (LuaEventItem *ev in _eventHooks) {
-        if ([ev.scriptName isEqualToString:scriptName]) {
-            luaL_unref(_L, LUA_REGISTRYINDEX, ev.callbackRef);
-        } else {
-            [keepEv addObject:ev];
-        }
-    }
-    _eventHooks = keepEv;
-}
-
-- (void)executeSingleScript:(NSString *)scriptName {
-    if (!_L) [self initLuaVM];
-    [self unloadScriptResources:scriptName];
-
-    if (![_enabledScripts[scriptName] boolValue]) {
-        _scriptStatuses[scriptName] = @"Отключён";
-        return;
-    }
-
-    NSString *path = [_baseDir stringByAppendingPathComponent:scriptName];
-    _currentLoadingScript = scriptName;
-    int err = luaL_loadfile(_L, [path UTF8String]);
-    if (err != LUA_OK) {
-        const char *msg = lua_tostring(_L, -1);
-        _scriptStatuses[scriptName] = [NSString stringWithFormat:@"Error: %s", msg ? msg : "syntax"];
-        lua_pop(_L, 1);
-        _currentLoadingScript = nil;
-        return;
-    }
-
-    if (lua_pcall(_L, 0, 0, 0) != LUA_OK) {
-        const char *msg = lua_tostring(_L, -1);
-        _scriptStatuses[scriptName] = [NSString stringWithFormat:@"Error: %s", msg ? msg : "runtime"];
-        lua_pop(_L, 1);
-    } else {
-        _scriptStatuses[scriptName] = @"Загружен";
-    }
-    _currentLoadingScript = nil;
-}
-
-- (void)loadAllEnabledScripts {
-    [self initLuaVM];
-    [_coroutines removeAllObjects];
-    [_commands removeAllObjects];
-    [_eventHooks removeAllObjects];
-    [_confirmedLocalCommands removeAllObjects];
-    [_pendingCommands removeAllObjects];
-
-    NSInteger loadedCount = 0;
-    for (NSString *scriptName in _discoveredScripts) {
-        [self executeSingleScript:scriptName];
-        if ([_scriptStatuses[scriptName] isEqualToString:@"Загружен"]) {
             loadedCount++;
+            [self appendLog:0 message:[NSString stringWithFormat:@"Загружен скрипт: %@", file]];
         }
+        lua_settop(_L, top);
     }
 
-    [self startTickTimer];
-    _statusLabel.text = [NSString stringWithFormat:@"42Loader • Загружено скриптов: %ld/%lu",
-                         (long)loadedCount, (unsigned long)_discoveredScripts.count];
-    if (self.showStartupBanner) {
-        self.statusBanner.hidden = NO;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            self.statusBanner.hidden = YES;
-        });
-    }
+    [self appendLog:0 message:[NSString stringWithFormat:@"Lua VM перезагружена. Активных скриптов: %d", loadedCount]];
+    [self.luaLock unlock];
 }
 
-- (void)reloadSingleScript:(NSString *)scriptName {
-    if (!_gameStarted) {
-        _gameStarted = YES;
-        [self initLuaVM];
-        [self startTickTimer];
-    }
-    [self executeSingleScript:scriptName];
+- (void)toggleScript:(NSString *)filename enabled:(BOOL)enabled {
+    self.scriptStates[filename] = @(enabled);
+    [self saveScriptStates];
+    [self reloadAllScripts];
 }
 
-- (void)setScript:(NSString *)scriptName enabled:(BOOL)enabled {
-    _enabledScripts[scriptName] = @(enabled);
-    [self saveState];
-    if (_gameStarted) {
-        if (enabled) {
-            [self executeSingleScript:scriptName];
-        } else {
-            [self unloadScriptResources:scriptName];
-            _scriptStatuses[scriptName] = @"Отключён";
+- (void)executeLuaString:(NSString *)code {
+    if (!code || code.length == 0) return;
+    [self.luaLock lock];
+    if (_L) {
+        int top = lua_gettop(_L);
+        if (luaL_dostring(_L, SafeUTF8(code)) != LUA_OK) {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[Console Error] %s", err ? err : "error"]];
         }
-    } else {
-        _scriptStatuses[scriptName] = enabled ? @"Ожидает запуска игры" : @"Отключён";
+        lua_settop(_L, top);
     }
+    [self.luaLock unlock];
 }
 
-- (void)startTickTimer {
-    if (_tickTimer) return;
-    _lastTick = CACurrentMediaTime();
-    _tickTimer = [NSTimer scheduledTimerWithTimeInterval:0.01 target:self selector:@selector(onTick) userInfo:nil repeats:YES];
-}
-
-- (void)onTick {
-    if (!_L) return;
-    NSTimeInterval now = CACurrentMediaTime();
-    double dt = now - _lastTick;
-    _lastTick = now;
-
-    if (_pendingCommands.count > 0) {
-        NSMutableArray<PendingCommandItem *> *stillPending = [NSMutableArray array];
-        for (PendingCommandItem *p in _pendingCommands) {
-            if (now - p.sentTime >= 1.5) {
-                [self registerKnownServerCommand:p.cmd persist:YES];
-            } else {
-                [stillPending addObject:p];
-            }
-        }
-        _pendingCommands = stillPending;
-    }
-
-    if (_coroutines.count > 0) {
-        NSArray<LuaCoroutineItem *> *snapshot = [_coroutines copy];
-        for (LuaCoroutineItem *item in snapshot) {
-            if (now >= item.wakeTime) {
-                int nres = 0;
-                int status = AZ_LUA_RESUME(item.co, _L, 0, &nres);
-                if (status == LUA_YIELD) {
-                    double ms = lua_gettop(item.co) > 0 ? lua_tonumber(item.co, -1) : 0.0;
-                    lua_settop(item.co, 0);
-                    item.wakeTime = now + (ms / 1000.0);
-                } else {
-                    if (status != LUA_OK) {
-                        const char *err = lua_tostring(item.co, -1);
-                        NSLog(@"[42Loader] Thread error (%@): %s", item.scriptName, err ? err : "unknown");
-                    }
-                    luaL_unref(_L, LUA_REGISTRYINDEX, item.ref);
-                    [_coroutines removeObject:item];
-                }
-            }
-        }
-    }
-
-    lua_getglobal(_L, "onUpdate");
-    if (lua_isfunction(_L, -1)) {
-        lua_pushnumber(_L, dt);
-        if (lua_pcall(_L, 1, 0, 0) != LUA_OK) {
-            lua_pop(_L, 1);
-        }
-    } else {
-        lua_pop(_L, 1);
-    }
-}
-
-- (void)executeLuaCommand:(LuaCommandItem *)item args:(NSString *)args {
-    if (!item || !_L) return;
-    lua_rawgeti(_L, LUA_REGISTRYINDEX, item.callbackRef);
-    lua_pushstring(_L, [args UTF8String]);
-    if (lua_pcall(_L, 1, 0, 0) != LUA_OK) {
-        const char *err = lua_tostring(_L, -1);
-        NSLog(@"[42Loader] Command /%@ error: %s", item.cmd, err ? err : "unknown");
-        lua_pop(_L, 1);
-    }
-}
+// ============================================================================
+// 7. Обработчики событий игры (с исправленными __block и ARC)
+// ============================================================================
 
 - (BOOL)handleOutgoingInput:(NSString *)text {
+    self.inGameSession = YES;
     if (!text || text.length == 0) return NO;
+
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (![trimmed hasPrefix:@"/"]) return NO;
 
     NSString *withoutSlash = [trimmed substringFromIndex:1];
     NSRange spaceRange = [withoutSlash rangeOfString:@" "];
-    NSString *cmd = (spaceRange.location == NSNotFound)
+    NSString *cmdName = (spaceRange.location == NSNotFound)
         ? [withoutSlash lowercaseString]
         : [[withoutSlash substringToIndex:spaceRange.location] lowercaseString];
     NSString *args = (spaceRange.location == NSNotFound)
         ? @""
         : [withoutSlash substringFromIndex:spaceRange.location + 1];
 
-    if ([cmd isEqualToString:@"luasettings"]) {
+    // Встроенная команда /luasettings открывает ImGui-интерфейс
+    if ([cmdName isEqualToString:@"luasettings"]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showSettingsWindow];
+            g_menuOpen = !g_menuOpen;
         });
         return YES;
     }
 
-    LuaCommandItem *item = _commands[cmd];
-    if (!item || !_L) {
-        return NO;
-    }
-
-    if (item.overrideServer || !_inGameSession) {
-        [self executeLuaCommand:item args:args];
+    [self.luaLock lock];
+    NSNumber *refNum = self.commands[cmdName];
+    if (refNum && _L) {
+        int top = lua_gettop(_L);
+        lua_rawgeti(_L, LUA_REGISTRYINDEX, [refNum intValue]);
+        lua_pushstring(_L, SafeUTF8(args));
+        if (lua_pcall(_L, 1, 0, 0) != LUA_OK) {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[Cmd /%@] %s", cmdName, err ? err : "error"]];
+        }
+        lua_settop(_L, top);
+        [self.luaLock unlock];
         return YES;
     }
-
-    if ([_knownServerCommands containsObject:cmd]) {
-        return NO;
-    }
-
-    if ([_confirmedLocalCommands containsObject:cmd]) {
-        [self executeLuaCommand:item args:args];
-        return YES;
-    }
-
-    PendingCommandItem *pending = [PendingCommandItem new];
-    pending.cmd = cmd;
-    pending.args = args;
-    pending.sentTime = CACurrentMediaTime();
-    [_pendingCommands addObject:pending];
+    [self.luaLock unlock];
     return NO;
 }
 
-- (BOOL)isUnknownCommandServerReply:(NSString *)rawText {
-    NSString *clean = [StripSampColors(rawText) lowercaseString];
-    if (clean.length == 0) return NO;
-    return [clean containsString:@"unknown command"] ||
-           [clean containsString:@"неизвестная команда"] ||
-           [clean containsString:@"команда не найдена"] ||
-           [clean containsString:@"такой команды не существует"] ||
-           [clean containsString:@"такой команды нет"];
-}
+- (BOOL)dispatchServerMessage:(uint32_t)color
+                         text:(NSString *)text
+                     outColor:(uint32_t *)outColor
+                      outText:(NSString **)outText {
+    self.inGameSession = YES;
+    if (!text) return YES;
 
-- (BOOL)dispatchServerMessage:(uint32_t)color text:(NSString *)text outColor:(uint32_t *)outColor outText:(NSString **)outText {
-    _inGameSession = YES;
-    if (!_L) return YES;
-
-    if (_pendingCommands.count > 0 && [self isUnknownCommandServerReply:text]) {
-        PendingCommandItem *matched = _pendingCommands.firstObject;
-        [_pendingCommands removeObjectAtIndex:0];
-        [_confirmedLocalCommands addObject:matched.cmd];
-        LuaCommandItem *item = _commands[matched.cmd];
-        if (item) {
-            [self executeLuaCommand:item args:matched.args];
-        }
-        return NO;
+    [self.luaLock lock];
+    if (!_L) {
+        [self.luaLock unlock];
+        return YES;
     }
 
-    BOOL allow = YES;
+    __block BOOL allow = YES;
+    __block uint32_t modifiedColor = color;
+    __block NSString *modifiedText = nil;
+
+    int top = lua_gettop(_L);
     auto invokeHandler = ^() {
         lua_pushinteger(_L, color);
-        lua_pushstring(_L, [text UTF8String]);
+        lua_pushstring(_L, SafeUTF8(text));
         if (lua_pcall(_L, 2, 1, 0) == LUA_OK) {
             if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
                 allow = NO;
             } else if (lua_istable(_L, -1)) {
                 lua_geti(_L, -1, 1);
-                if (lua_isinteger(_L, -1)) *outColor = (uint32_t)lua_tointeger(_L, -1);
+                if (lua_isinteger(_L, -1)) {
+                    modifiedColor = (uint32_t)lua_tointeger(_L, -1);
+                }
                 lua_pop(_L, 1);
+
                 lua_geti(_L, -1, 2);
-                if (lua_isstring(_L, -1)) *outText = [NSString stringWithUTF8String:lua_tostring(_L, -1)] ?: text;
+                if (lua_isstring(_L, -1)) {
+                    const char *s = lua_tostring(_L, -1);
+                    if (s) modifiedText = [NSString stringWithUTF8String:s];
+                }
                 lua_pop(_L, 1);
             }
+        } else {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[onServerMessage] %s", err ? err : "error"]];
         }
         lua_pop(_L, 1);
     };
@@ -1658,31 +1453,45 @@ static int luaopen_inicfg_shim(lua_State *L) {
         lua_pop(_L, 1);
     }
 
-    for (LuaEventItem *ev in [_eventHooks copy]) {
-        if ([ev.eventName isEqualToString:@"onServerMessage"]) {
-            lua_rawgeti(_L, LUA_REGISTRYINDEX, ev.callbackRef);
-            invokeHandler();
-        }
-    }
+    lua_settop(_L, top);
+    [self.luaLock unlock];
+
+    if (outColor) *outColor = modifiedColor;
+    if (outText && modifiedText) *outText = modifiedText;
     return allow;
 }
 
-- (BOOL)dispatchShowDialog:(int)dialogId style:(int)style title:(NSString *)title btn1:(NSString *)btn1 btn2:(NSString *)btn2 text:(NSString *)text {
-    _inGameSession = YES;
-    if (!_L) return YES;
-    BOOL allow = YES;
+- (BOOL)dispatchShowDialog:(int)dialogId
+                     style:(int)style
+                     title:(NSString *)title
+                      btn1:(NSString *)btn1
+                      btn2:(NSString *)btn2
+                      text:(NSString *)text {
+    self.inGameSession = YES;
+
+    [self.luaLock lock];
+    if (!_L) {
+        [self.luaLock unlock];
+        return YES;
+    }
+
+    __block BOOL allow = YES;
+    int top = lua_gettop(_L);
 
     auto invokeDialog = ^() {
         lua_pushinteger(_L, dialogId);
         lua_pushinteger(_L, style);
-        lua_pushstring(_L, [title UTF8String]);
-        lua_pushstring(_L, [btn1 UTF8String]);
-        lua_pushstring(_L, [btn2 UTF8String]);
-        lua_pushstring(_L, [text UTF8String]);
+        lua_pushstring(_L, SafeUTF8(title));
+        lua_pushstring(_L, SafeUTF8(btn1));
+        lua_pushstring(_L, SafeUTF8(btn2));
+        lua_pushstring(_L, SafeUTF8(text));
         if (lua_pcall(_L, 6, 1, 0) == LUA_OK) {
             if (lua_isboolean(_L, -1) && !lua_toboolean(_L, -1)) {
                 allow = NO;
             }
+        } else {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[onShowDialog] %s", err ? err : "error"]];
         }
         lua_pop(_L, 1);
     };
@@ -1694,195 +1503,363 @@ static int luaopen_inicfg_shim(lua_State *L) {
         lua_pop(_L, 1);
     }
 
-    for (LuaEventItem *ev in [_eventHooks copy]) {
-        if ([ev.eventName isEqualToString:@"onShowDialog"]) {
-            lua_rawgeti(_L, LUA_REGISTRYINDEX, ev.callbackRef);
-            invokeDialog();
-        }
-    }
+    lua_settop(_L, top);
+    [self.luaLock unlock];
     return allow;
 }
 
-- (UIWindow *)keyWindow {
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) return w;
-            }
-            if (ws.windows.firstObject) return ws.windows.firstObject;
-        }
-    }
-    return [UIApplication sharedApplication].windows.firstObject;
-}
-
-- (void)setupOverlayUI {
-    UIWindow *win = [self keyWindow];
-    if (!win) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self setupOverlayUI];
-        });
+- (void)tickFrame {
+    [self.luaLock lock];
+    if (!_L) {
+        [self.luaLock unlock];
         return;
     }
 
-    if (!_statusBanner) {
-        _statusBanner = [[UIView alloc] init];
-        _statusBanner.translatesAutoresizingMaskIntoConstraints = NO;
-        _statusBanner.userInteractionEnabled = YES;
-        [win addSubview:_statusBanner];
+    NSTimeInterval now = CACurrentMediaTime();
+    NSTimeInterval dt = now - self.lastTickTime;
+    self.lastTickTime = now;
 
-        _statusLabel = [[UILabel alloc] init];
-        _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        _statusLabel.textColor = [UIColor whiteColor];
-        _statusLabel.font = [UIFont boldSystemFontOfSize:12];
-        _statusLabel.textAlignment = NSTextAlignmentCenter;
-        [_statusBanner addSubview:_statusLabel];
+    // 1. Планировщик корутин (wait)
+    if (self.coroutines.count > 0) {
+        NSMutableArray<NSNumber *> *alive = [NSMutableArray array];
+        for (NSNumber *entryRefNum in self.coroutines) {
+            int entryRef = [entryRefNum intValue];
+            int top = lua_gettop(_L);
+            lua_rawgeti(_L, LUA_REGISTRYINDEX, entryRef);
+            if (!lua_istable(_L, -1)) {
+                luaL_unref(_L, LUA_REGISTRYINDEX, entryRef);
+                lua_settop(_L, top);
+                continue;
+            }
+            lua_getfield(L, -1, "wake");
+            NSTimeInterval wake = lua_tonumber(_L, -1);
+            lua_pop(_L, 1);
 
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(showSettingsWindow)];
-        [_statusBanner addGestureRecognizer:tap];
+            if (now < wake) {
+                [alive addObject:entryRefNum];
+                lua_settop(_L, top);
+                continue;
+            }
 
-        [NSLayoutConstraint activateConstraints:@[
-            [_statusBanner.topAnchor constraintEqualToAnchor:win.safeAreaLayoutGuide.topAnchor constant:8],
-            [_statusBanner.centerXAnchor constraintEqualToAnchor:win.centerXAnchor],
-            [_statusBanner.heightAnchor constraintEqualToConstant:28],
+            lua_getfield(_L, -1, "ref");
+            int threadRef = (int)lua_tointeger(_L, -1);
+            lua_pop(_L, 1);
 
-            [_statusLabel.leadingAnchor constraintEqualToAnchor:_statusBanner.leadingAnchor constant:14],
-            [_statusLabel.trailingAnchor constraintEqualToAnchor:_statusBanner.trailingAnchor constant:-14],
-            [_statusLabel.centerYAnchor constraintEqualToAnchor:_statusBanner.centerYAnchor]
-        ]];
+            lua_rawgeti(_L, LUA_REGISTRYINDEX, threadRef);
+            lua_State *co = lua_tothread(_L, -1);
+            lua_pop(_L, 1);
+
+            if (co) {
+                int status = lua_resume(co, _L, 0, nullptr);
+                if (status == LUA_YIELD) {
+                    NSTimeInterval nextWake = now;
+                    if (lua_gettop(co) >= 1 && lua_isnumber(co, -1)) {
+                        nextWake = lua_tonumber(co, -1);
+                        lua_pop(co, 1);
+                    }
+                    lua_pushnumber(_L, nextWake);
+                    lua_setfield(_L, -2, "wake");
+                    [alive addObject:entryRefNum];
+                } else {
+                    if (status != LUA_OK) {
+                        const char *err = lua_tostring(co, -1);
+                        [self appendLog:2 message:[NSString stringWithFormat:@"[Thread Error] %s", err ? err : "error"]];
+                    }
+                    luaL_unref(_L, LUA_REGISTRYINDEX, threadRef);
+                    luaL_unref(_L, LUA_REGISTRYINDEX, entryRef);
+                }
+            } else {
+                luaL_unref(_L, LUA_REGISTRYINDEX, threadRef);
+                luaL_unref(_L, LUA_REGISTRYINDEX, entryRef);
+            }
+            lua_settop(_L, top);
+        }
+        self.coroutines = alive;
     }
 
-    if (!_floatingButton) {
-        _floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-        _floatingButton.translatesAutoresizingMaskIntoConstraints = NO;
-        [_floatingButton setTitle:@"42" forState:UIControlStateNormal];
-        [_floatingButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        _floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        [_floatingButton addTarget:self action:@selector(showSettingsWindow) forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:_floatingButton];
+    // 2. Вызов onDraw() в Lua (если определён в скриптах)
+    {
+        std::lock_guard<std::mutex> lock(g_renderMutex);
+        g_frameDrawCommands.clear();
+    }
+    int top = lua_gettop(_L);
+    lua_getglobal(_L, "onDraw");
+    if (lua_isfunction(_L, -1)) {
+        lua_pushnumber(_L, dt);
+        if (lua_pcall(_L, 1, 0, 0) != LUA_OK) {
+            const char *err = lua_tostring(_L, -1);
+            [self appendLog:2 message:[NSString stringWithFormat:@"[onDraw] %s", err ? err : "error"]];
+        }
+    }
+    lua_settop(_L, top);
 
-        [NSLayoutConstraint activateConstraints:@[
-            [_floatingButton.topAnchor constraintEqualToAnchor:win.safeAreaLayoutGuide.topAnchor constant:8],
-            [_floatingButton.trailingAnchor constraintEqualToAnchor:win.safeAreaLayoutGuide.trailingAnchor constant:-12],
-            [_floatingButton.widthAnchor constraintEqualToConstant:34],
-            [_floatingButton.heightAnchor constraintEqualToConstant:28]
-        ]];
+    [self.luaLock unlock];
+}
+
+- (void)renderImGuiFrames {
+    [self.luaLock lock];
+    if (!_L || self.imguiFrameCallbacks.count == 0) {
+        [self.luaLock unlock];
+        return;
     }
 
-    [self applyThemeToOverlay];
-}
+    for (NSNumber *refNum in [self.imguiFrameCallbacks copy]) {
+        int ref = [refNum intValue];
+        int top = lua_gettop(_L);
+        lua_rawgeti(_L, LUA_REGISTRYINDEX, ref);
+        if (!lua_istable(_L, -1)) {
+            lua_settop(_L, top);
+            continue;
+        }
+        lua_getfield(_L, -1, "cond");
+        BOOL shouldDraw = NO;
+        if (lua_isfunction(_L, -1) && lua_pcall(_L, 0, 1, 0) == LUA_OK) {
+            shouldDraw = (lua_toboolean(_L, -1) != 0);
+        }
+        lua_settop(_L, top);
 
-- (void)applyThemeToOverlay {
-    UIColor *accent = [self currentAccentColor];
-    UIColor *bg = [[UIColor colorWithRed:0.08 green:0.04 blue:0.15 alpha:1.0] colorWithAlphaComponent:_uiAlpha];
-
-    _statusBanner.backgroundColor = bg;
-    _statusBanner.layer.cornerRadius = MIN(_cornerRadius, 14.0);
-    _statusBanner.layer.borderWidth = 1.0;
-    _statusBanner.layer.borderColor = [accent colorWithAlphaComponent:0.8].CGColor;
-
-    _floatingButton.backgroundColor = bg;
-    _floatingButton.layer.cornerRadius = MIN(_cornerRadius, 14.0);
-    _floatingButton.layer.borderWidth = 1.0;
-    _floatingButton.layer.borderColor = [accent colorWithAlphaComponent:0.8].CGColor;
-    _floatingButton.hidden = !_showFloatingBtn;
-}
-
-- (void)showSettingsWindow {
-    if (_settingsVC) return;
-    [self scanScriptsOnly];
-    UIWindow *win = [self keyWindow];
-    UIViewController *root = win.rootViewController;
-    while (root.presentedViewController) {
-        root = root.presentedViewController;
+        if (shouldDraw) {
+            lua_rawgeti(_L, LUA_REGISTRYINDEX, ref);
+            lua_getfield(_L, -1, "draw");
+            if (lua_isfunction(_L, -1)) {
+                if (lua_pcall(_L, 0, 0, 0) != LUA_OK) {
+                    const char *err = lua_tostring(_L, -1);
+                    [self appendLog:2 message:[NSString stringWithFormat:@"[imgui.OnFrame] %s", err ? err : "error"]];
+                }
+            }
+            lua_settop(_L, top);
+        }
     }
-    LoaderSettingsVC *vc = [[LoaderSettingsVC alloc] init];
-    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-    _settingsVC = vc;
-    [root presentViewController:vc animated:YES completion:nil];
+
+    [self.luaLock unlock];
 }
 
+// iOS 14+ UNUserNotificationCenterDelegate (без устаревшего UNNotificationPresentationOptionAlert)
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    if (@available(iOS 14.0, *)) {
-        completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
-    } else {
-        completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound);
-    }
+    (void)center;
+    (void)notification;
+    completionHandler(UNNotificationPresentationOptionBanner |
+                      UNNotificationPresentationOptionList |
+                      UNNotificationPresentationOptionSound);
 }
 
 @end
 
-static IMP orig_sendAction = NULL;
-static void swizzled_sendAction(id self, SEL _cmd, SEL action, id target, UIEvent *event) {
-    if ([self isKindOfClass:[UIButton class]]) {
-        UIButton *btn = (UIButton *)self;
-        NSString *title = [btn currentTitle] ?: btn.titleLabel.text ?: @"";
-        NSString *lower = [title lowercaseString];
-        if ([lower containsString:@"играть"] || [lower containsString:@"play"]) {
-            [[LoaderEngine shared] triggerStageTwoIfNeeded];
-        }
-    }
-    ((void (*)(id, SEL, SEL, id, UIEvent *))orig_sendAction)(self, _cmd, action, target, event);
-}
+// ============================================================================
+// 8. Metal + Dear ImGui Overlay View (с прозрачными касаниями и клавиатурой iOS)
+// ============================================================================
 
-static IMP orig_textFieldShouldReturn = NULL;
-static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField *textField) {
-    if (textField.text.length > 0 && [[LoaderEngine shared] handleOutgoingInput:textField.text]) {
-        textField.text = @"";
-        [textField resignFirstResponder];
-        return NO;
-    }
-    if (orig_textFieldShouldReturn) {
-        return ((BOOL (*)(id, SEL, UITextField *))orig_textFieldShouldReturn)(self, _cmd, textField);
-    }
-    return YES;
-}
+@interface LoaderOverlayView : MTKView <MTKViewDelegate, UIKeyInput>
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property (nonatomic, assign) CFTimeInterval lastFrameTime;
+@property (nonatomic, assign) BOOL keyboardActive;
+@end
 
-static void on_dyld_image_added(const struct mach_header *header, intptr_t slide) {
-    Dl_info info;
-    if (dladdr(header, &info) && info.dli_fname) {
-        if (strstr(info.dli_fname, "libag-client") != NULL) {
-            [[LoaderEngine shared] triggerStageTwoIfNeeded];
-        }
-    }
-}
+@implementation LoaderOverlayView
 
-__attribute__((constructor))
-static void initializer() {
-    Method mSend = class_getInstanceMethod([UIControl class], @selector(sendAction:to:forEvent:));
-    if (mSend) {
-        orig_sendAction = method_setImplementation(mSend, (IMP)swizzled_sendAction);
-    }
+- (instancetype)initWithFrame:(CGRect)frame device:(id<MTLDevice>)device {
+    if (self = [super initWithFrame:frame device:device]) {
+        self.delegate = self;
+        self.opaque = NO;
+        self.backgroundColor = [UIColor clearColor];
+        self.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+        self.framebufferOnly = NO;
+        self.preferredFramesPerSecond = 60;
+        self.multipleTouchEnabled = YES;
+        self.userInteractionEnabled = YES;
 
-    register_rebinding("AddClientCommand", (void *)hooked_AddClientCommand, (void **)&orig_AddClientCommand);
-    register_rebinding("_Z16AddClientCommandPKcPFvPcE", (void *)hooked_AddClientCommand, (void **)&orig_AddClientCommand);
-    register_rebinding("AddChatMessage", (void *)hooked_AddChatMessage, (void **)&orig_AddChatMessage);
-    register_rebinding("_Z14AddChatMessagejPKc", (void *)hooked_AddChatMessage, (void **)&orig_AddChatMessage);
-    register_rebinding("ShowDialog", (void *)hooked_ShowDialog, (void **)&orig_ShowDialog);
+        _commandQueue = [device newCommandQueue];
+        _lastFrameTime = CACurrentMediaTime();
 
-    _dyld_register_func_for_add_image(on_dyld_image_added);
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO &io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.IniFilename = nullptr; // Не засоряем корень диска
 
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
-        [[LoaderEngine shared] bootStageOne];
-    }];
-
-    [[NSNotificationCenter defaultCenter] addObserverForName:UITextFieldTextDidBeginEditingNotification
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
-        UITextField *tf = note.object;
-        id del = tf.delegate;
-        if (del && !orig_textFieldShouldReturn) {
-            Method mRet = class_getInstanceMethod([del class], @selector(textFieldShouldReturn:));
-            if (mRet) {
-                orig_textFieldShouldReturn = method_setImplementation(mRet, (IMP)swizzled_textFieldShouldReturn);
+        // Загружаем системный шрифт iOS с поддержкой кириллицы
+        NSArray<NSString *> *fontCandidates = @[
+            @"/System/Library/Fonts/Core/HelveticaNeue.ttc",
+            @"/System/Library/Fonts/CoreAddition/Arial.ttf",
+            @"/System/Library/Fonts/CoreUI/SFUI.ttf"
+        ];
+        bool fontLoaded = false;
+        for (NSString *path in fontCandidates) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                ImFontConfig cfg;
+                cfg.OversampleH = 2;
+                cfg.OversampleV = 2;
+                if (io.Fonts->AddFontFromFileTTF(SafeUTF8(path), 15.0f, &cfg, io.Fonts->GetGlyphRangesCyrillic()) != nullptr) {
+                    fontLoaded = true;
+                    break;
+                }
             }
         }
-    }];
+        if (!fontLoaded) {
+            io.Fonts->AddFontDefault();
+        }
+
+        // Тёмно-фиолетовая тема ImGui
+        ImGui::StyleColorsDark();
+        ImGuiStyle &style = ImGui::GetStyle();
+        style.WindowRounding = 10.0f;
+        style.FrameRounding = 6.0f;
+        style.GrabRounding = 6.0f;
+        style.TabRounding = 6.0f;
+        style.WindowBorderSize = 1.0f;
+        style.FramePadding = ImVec2(8.0f, 6.0f);
+        style.ItemSpacing = ImVec2(8.0f, 7.0f);
+
+        ImVec4 *colors = style.Colors;
+        colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.11f, 0.94f);
+        colors[ImGuiCol_Border] = ImVec4(0.55f, 0.27f, 0.92f, 0.55f);
+        colors[ImGuiCol_TitleBg] = ImVec4(0.11f, 0.09f, 0.16f, 1.00f);
+        colors[ImGuiCol_TitleBgActive] = ImVec4(0.36f, 0.16f, 0.65f, 1.00f);
+        colors[ImGuiCol_FrameBg] = ImVec4(0.14f, 0.14f, 0.19f, 1.00f);
+        colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.18f, 0.36f, 1.00f);
+        colors[ImGuiCol_FrameBgActive] = ImVec4(0.35f, 0.22f, 0.54f, 1.00f);
+        colors[ImGuiCol_Button] = ImVec4(0.45f, 0.20f, 0.80f, 0.85f);
+        colors[ImGuiCol_ButtonHovered] = ImVec4(0.56f, 0.28f, 0.92f, 1.00f);
+        colors[ImGuiCol_ButtonActive] = ImVec4(0.36f, 0.14f, 0.68f, 1.00f);
+        colors[ImGuiCol_CheckMark] = ImVec4(0.75f, 0.45f, 1.00f, 1.00f);
+        colors[ImGuiCol_SliderGrab] = ImVec4(0.65f, 0.35f, 0.98f, 1.00f);
+        colors[ImGuiCol_SliderGrabActive] = ImVec4(0.78f, 0.50f, 1.00f, 1.00f);
+        colors[ImGuiCol_Tab] = ImVec4(0.16f, 0.13f, 0.23f, 1.00f);
+        colors[ImGuiCol_TabHovered] = ImVec4(0.50f, 0.24f, 0.85f, 0.85f);
+        colors[ImGuiCol_TabActive] = ImVec4(0.42f, 0.18f, 0.75f, 1.00f);
+        colors[ImGuiCol_Header] = ImVec4(0.42f, 0.18f, 0.75f, 0.75f);
+        colors[ImGuiCol_HeaderHovered] = ImVec4(0.52f, 0.25f, 0.88f, 0.90f);
+
+        ImGui_ImplMetal_Init(device);
+
+        // Жест 3 пальцами открывает/закрывает ImGui меню в любой момент
+        UITapGestureRecognizer *threeFingerTap =
+            [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onThreeFingerTap)];
+        threeFingerTap.numberOfTouchesRequired = 3;
+        threeFingerTap.cancelsTouchesInView = NO;
+        [self addGestureRecognizer:threeFingerTap];
+    }
+    return self;
 }
+
+- (void)onThreeFingerTap {
+    g_menuOpen = !g_menuOpen;
+}
+
+// Пропускаем касания в игру, если палец не попал ни в одно видимое окно ImGui
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    (void)event;
+    if (!ImGui::GetCurrentContext()) return nil;
+    ImGuiIO &io = ImGui::GetIO();
+    if (io.WantCaptureMouse || g_menuOpen) {
+        if (g_menuOpen) return self;
+    }
+    // Проверяем попадание в окна, созданные скриптами через imgui.OnFrame
+    ImVec2 pt((float)point.x, (float)point.y);
+    if (ImGui::IsAnyItemHovered() || io.WantCaptureMouse) {
+        return self;
+    }
+    // Проверяем прямоугольники всех активных окон (кроме Debug)
+    ImGuiContext &g = *ImGui::GetCurrentContext();
+    for (int i = 0; i < g.Windows.Size; i++) {
+        ImGuiWindow *win = g.Windows[i];
+        if (!win->Active || win->Hidden) continue;
+        if (strcmp(win->Name, "Debug##Default") == 0) continue;
+        if (pt.x >= win->Pos.x && pt.x <= win->Pos.x + win->Size.x &&
+            pt.y >= win->Pos.y && pt.y <= win->Pos.y + win->Size.y) {
+            return self;
+        }
+    }
+    return nil;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *touch = [touches anyObject];
+    if (!touch) return;
+    CGPoint p = [touch locationInView:self];
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddMousePosEvent((float)p.x, (float)p.y);
+    io.AddMouseButtonEvent(0, true);
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *touch = [touches anyObject];
+    if (!touch) return;
+    CGPoint p = [touch locationInView:self];
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddMousePosEvent((float)p.x, (float)p.y);
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *touch = [touches anyObject];
+    if (touch) {
+        CGPoint p = [touch locationInView:self];
+        ImGui::GetIO().AddMousePosEvent((float)p.x, (float)p.y);
+    }
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches;
+    (void)event;
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+}
+
+// Поддержка iOS-клавиатуры для ImGui::InputText
+- (BOOL)canBecomeFirstResponder { return YES; }
+- (BOOL)hasText { return YES; }
+
+- (void)insertText:(NSString *)text {
+    if (!text) return;
+    ImGuiIO &io = ImGui::GetIO();
+    if ([text isEqualToString:@"\n"]) {
+        io.AddKeyEvent(ImGuiKey_Enter, true);
+        io.AddKeyEvent(ImGuiKey_Enter, false);
+    } else {
+        io.AddInputCharactersUTF8(SafeUTF8(text));
+    }
+}
+
+- (void)deleteBackward {
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiKey_Backspace, true);
+    io.AddKeyEvent(ImGuiKey_Backspace, false);
+}
+
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
+    (void)view;
+    (void)size;
+}
+
+- (void)drawInMTKView:(MTKView *)view {
+    MTLRenderPassDescriptor *rpd = view.currentRenderPassDescriptor;
+    id<CAMetalDrawable> drawable = view.currentDrawable;
+    if (!rpd || !drawable) return;
+
+    // Тик Lua корутин и onDraw()
+    [[LoaderEngine shared] tickFrame];
+
+    CFTimeInterval now = CACurrentMediaTime();
+    float dt = (float)(now - self.lastFrameTime);
+    self.lastFrameTime = now;
+    if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 60.0f;
+
+    ImGuiIO &io = ImGui::GetIO();
+    CGSize boundsSize = view.bounds.size;
+    CGFloat scale = view.contentScaleFactor > 0 ? view.contentScaleFactor : [UIScreen mainScreen].scale;
+    io.DisplaySize = ImVec2((float)boundsSize.width, (float)boundsSize.height);
+    io.DisplayFramebufferScale = ImVec2((float)scale, (float)scale);
+    io.DeltaTime = dt;
+
+    // Управление системной клавиатурой iOS при фокусе на InputText
+    if (io.WantTextInput && !self.keyboardActive) {
+        self.keyboardActive = YES;
+        [self becomeFirstResponder];
+    } else if (!io.WantTextInput && self.keyboardActive) {
+        self.keyboardActive = NO;
+        [self resignFirstResponder];
