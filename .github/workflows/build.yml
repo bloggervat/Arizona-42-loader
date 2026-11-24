@@ -20,7 +20,7 @@ jobs:
           tar -xzf lua-5.4.7.tar.gz
           cp lua-5.4.7/src/*.c lua-5.4.7/src/*.h lua-5.4.7/src/lua.hpp build/lua/
           rm -f build/lua/lua.c build/lua/luac.c
-          sed -i '' 's/system(cmd)/((cmd) == NULL ? 0 : -1)/g' build/lua/loslib.c
+          sed -i '' 's/#define l_system(cmd).*/#define l_system(cmd) ((cmd) == NULL ? 0 : -1)/g' build/lua/loslib.c
 
       - name: Download Dear ImGui v1.91.6
         run: |
