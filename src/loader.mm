@@ -19,6 +19,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <atomic>
+#include <cstdint>
 
 extern "C" {
 #include "lua.h"
@@ -30,30 +32,12 @@ extern "C" {
 #include "imgui_impl_metal.h"
 
 // ============================================================================
-// 1. JNI / SAMP / DYSYM HOOK TYPES
+// 1. NATIVE INTEGRATION STATE
 // ============================================================================
-
-typedef void* JNIEnv;
-typedef void* jobject;
-typedef void* jbyteArray;
-
-typedef void* (*Fn_dlsym)(void* handle, const char* symbol);
-typedef void (*Fn_OnInputEnd)(JNIEnv* env, jobject thiz, jbyteArray array);
-typedef void (*Fn_SendCommand)(void* thisPtr, const char* cmd);
-typedef void (*Fn_SendChat)(void* thisPtr, const char* msg);
-typedef void (*Fn_AddChatMessage)(void* thisPtr, uint32_t color, const char* text);
-typedef void (*Fn_ShowDialog)(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b);
-
-static Fn_dlsym orig_dlsym = nullptr;
-static Fn_OnInputEnd orig_OnInputEnd = nullptr;
-static Fn_SendCommand orig_SendCommand = nullptr;
-static Fn_SendChat orig_SendChat = nullptr;
-static Fn_AddChatMessage orig_AddChatMessage = nullptr;
-static Fn_ShowDialog orig_ShowDialog = nullptr;
-
-static JNIEnv* g_LastJNIEnv = nullptr;
-static jobject g_LastJObject = nullptr;
-static void* g_LastNetGamePtr = nullptr;
+// The previous build attempted to rebind guessed Android/JNI and C++ symbols
+// during dyld image loading. That path is intentionally disabled in this
+// stability build. The Arizona iOS chat ABI must be verified before adding a
+// native input hook.
 
 // ============================================================================
 // 2. ENCODING HELPERS (CP1251 <-> UTF-8)
@@ -193,11 +177,13 @@ static int g_WorldHour = 12;
 static int g_WorldMinute = 0;
 static int g_WorldWeather = 1;
 
-static std::string g_LiveKeyboardBuffer;
 static std::string g_LastInterceptedCmd;
 static uint64_t g_LastInterceptedMs = 0;
 
 static UIButton* g_FloatingMenuButton = nullptr;
+static std::atomic<bool> g_LoaderStarted{false};
+static std::atomic<bool> g_ButtonEnsureScheduled{false};
+static std::atomic<bool> g_MetalHookInstalled{false};
 
 static uint64_t NowMs() {
     using namespace std::chrono;
@@ -296,9 +282,15 @@ static void ToggleLoaderMenu() {
 @end
 
 static void EnsureFloatingMenuButton() {
+    bool expected = false;
+    if (!g_ButtonEnsureScheduled.compare_exchange_strong(expected, true)) return;
+
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow* win = GetActiveKeyWindow();
-        if (!win) return;
+        if (!win) {
+            g_ButtonEnsureScheduled.store(false);
+            return;
+        }
 
         if (g_FloatingMenuButton) {
             if (g_FloatingMenuButton.superview != win) {
@@ -442,34 +434,10 @@ static LuaScriptInstance* FindScriptByState(lua_State* L) {
 // ============================================================================
 
 static void SendRawToGameChat(const std::string& utf8Text) {
-    std::string cpText = Utf8ToCp1251(utf8Text);
-
-    if (!cpText.empty() && cpText[0] == '/' && orig_SendCommand && g_LastNetGamePtr) {
-        orig_SendCommand(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-    if (orig_SendChat && g_LastNetGamePtr) {
-        orig_SendChat(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-
-    Fn_SendCommand dynSendCmd = orig_dlsym
-        ? (Fn_SendCommand)orig_dlsym(RTLD_DEFAULT, "_ZN4CNetGame11SendCommandEPKc")
-        : (Fn_SendCommand)dlsym(RTLD_DEFAULT, "_ZN4CNetGame11SendCommandEPKc");
-    Fn_SendChat dynSendChat = orig_dlsym
-        ? (Fn_SendChat)orig_dlsym(RTLD_DEFAULT, "_ZN4CNetGame8SendChatEPKc")
-        : (Fn_SendChat)dlsym(RTLD_DEFAULT, "_ZN4CNetGame8SendChatEPKc");
-
-    if (!cpText.empty() && cpText[0] == '/' && dynSendCmd && g_LastNetGamePtr) {
-        dynSendCmd(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-    if (dynSendChat && g_LastNetGamePtr) {
-        dynSendChat(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-
-    LogConsole("[ChatOut -> Server] " + utf8Text);
+    // Do not call guessed C++ methods with a fabricated/stale CNetGame pointer.
+    // A verified iOS transport adapter will be added after the Arizona binary's
+    // actual input/network ABI is established.
+    LogConsole("[ChatOut unavailable] Native Arizona chat transport is not attached: " + utf8Text);
 }
 
 static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourceTag = "unknown") {
@@ -547,340 +515,26 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     return true;
 }
 
-static void hooked_OnInputEnd(JNIEnv* env, jobject thiz, jbyteArray array) {
-    g_LastJNIEnv = env;
-    g_LastJObject = thiz;
-
-    if (env && array) {
-        void** vtable = *reinterpret_cast<void***>(env);
-        typedef int (*Fn_GetArrayLength)(JNIEnv*, jbyteArray);
-        typedef int8_t* (*Fn_GetByteArrayElements)(JNIEnv*, jbyteArray, uint8_t*);
-        typedef void (*Fn_ReleaseByteArrayElements)(JNIEnv*, jbyteArray, int8_t*, int);
-
-        auto getLen = reinterpret_cast<Fn_GetArrayLength>(vtable[171]);
-        auto getBytes = reinterpret_cast<Fn_GetByteArrayElements>(vtable[184]);
-        auto relBytes = reinterpret_cast<Fn_ReleaseByteArrayElements>(vtable[192]);
-
-        if (getLen && getBytes && relBytes) {
-            int len = getLen(env, array);
-            if (len > 0 && len < 4096) {
-                int8_t* ptr = getBytes(env, array, nullptr);
-                if (ptr) {
-                    std::string text(reinterpret_cast<const char*>(ptr), len);
-                    relBytes(env, array, ptr, 2);
-
-                    if (TryExecuteChatCommand(text, "JNI-OnInputEnd")) {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    if (orig_OnInputEnd) {
-        orig_OnInputEnd(env, thiz, array);
-    }
-}
-
-static void hooked_SendCommand(void* thisPtr, const char* cmd) {
-    g_LastNetGamePtr = thisPtr;
-    if (cmd && TryExecuteChatCommand(cmd, "SendCommand")) {
-        return;
-    }
-    if (orig_SendCommand) {
-        orig_SendCommand(thisPtr, cmd);
-    }
-}
-
-static void hooked_SendChat(void* thisPtr, const char* msg) {
-    g_LastNetGamePtr = thisPtr;
-    if (msg && TryExecuteChatCommand(msg, "SendChat")) {
-        return;
-    }
-    if (orig_SendChat) {
-        orig_SendChat(thisPtr, msg);
-    }
-}
-
 // ============================================================================
-// 6. INCOMING CHAT & DIALOG HOOKS -> samp.events
+// 7. PASSIVE UIKit INPUT OBSERVATION (NO SWIZZLING / NO SUBMIT INTERCEPTION)
 // ============================================================================
+// Text-change notifications are observational only. They are not treated as
+// submit events and never execute a command when the keyboard closes.
 
-static void DispatchSampEvent(const char* eventName, uint32_t color, const std::string& text) {
-    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    for (auto* s : g_Scripts) {
-        if (!s->enabled || !s->L || s->hasError) continue;
-        lua_State* L = s->L;
-        lua_getglobal(L, "_DISPATCH_SAMP_EVENT");
-        if (lua_isfunction(L, -1)) {
-            lua_pushstring(L, eventName);
-            lua_pushinteger(L, color);
-            lua_pushstring(L, text.c_str());
-            if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
-                const char* err = lua_tostring(L, -1);
-                LogConsole("[Event " + std::string(eventName) + " ERROR] " + (err ? err : ""));
-                lua_pop(L, 1);
-            }
-        } else {
-            lua_pop(L, 1);
-        }
-    }
-}
-
-static void hooked_AddChatMessage(void* thisPtr, uint32_t color, const char* text) {
-    if (text) {
-        std::string utf8 = Cp1251ToUtf8(text);
-        {
-            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-            g_ChatHistory.push_back({utf8, "", color, color});
-            if (g_ChatHistory.size() > 100) {
-                g_ChatHistory.erase(g_ChatHistory.begin());
-            }
-        }
-        DispatchSampEvent("onServerMessage", color, utf8);
-    }
-    if (orig_AddChatMessage) {
-        orig_AddChatMessage(thisPtr, color, text);
-    }
-}
-
-static void hooked_ShowDialog(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b) {
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        g_CurrentDialogId = id;
-        g_CurrentDialogStyle = style;
-        g_IsDialogActive = true;
-        g_CurrentDialogTitle = title ? Cp1251ToUtf8(title) : "";
-        g_CurrentDialogText = text ? Cp1251ToUtf8(text) : "";
-    }
-    if (orig_ShowDialog) {
-        orig_ShowDialog(thisPtr, id, style, title, text, btn1, btn2, b);
-    }
-}
-
-// ============================================================================
-// 7. FISHHOOK (INCLUDING dlsym) + OBJECTIVE-C KEYBOARD SWIZZLING
-// ============================================================================
-
-static void* hooked_dlsym(void* handle, const char* symbol) {
-    void* addr = orig_dlsym ? orig_dlsym(handle, symbol) : nullptr;
-    if (!symbol || !addr) return addr;
-
-    if (strcmp(symbol, "Java_com_arizona_game_GTASA_OnInputEnd") == 0) {
-        if (!orig_OnInputEnd) orig_OnInputEnd = (Fn_OnInputEnd)addr;
-        LogConsole("[HookDiag:dlsym] Перехвачен резолв Java_com_arizona_game_GTASA_OnInputEnd");
-        return (void*)hooked_OnInputEnd;
-    }
-    if (strcmp(symbol, "_ZN4CNetGame11SendCommandEPKc") == 0) {
-        if (!orig_SendCommand) orig_SendCommand = (Fn_SendCommand)addr;
-        return (void*)hooked_SendCommand;
-    }
-    if (strcmp(symbol, "_ZN4CNetGame8SendChatEPKc") == 0) {
-        if (!orig_SendChat) orig_SendChat = (Fn_SendChat)addr;
-        return (void*)hooked_SendChat;
-    }
-    if (strcmp(symbol, "_ZN11CChatWindow14AddChatMessageEjPKc") == 0) {
-        if (!orig_AddChatMessage) orig_AddChatMessage = (Fn_AddChatMessage)addr;
-        return (void*)hooked_AddChatMessage;
-    }
-    if (strcmp(symbol, "_ZN7CDialog4ShowEiiPKcS1_S1_S1_b") == 0) {
-        if (!orig_ShowDialog) orig_ShowDialog = (Fn_ShowDialog)addr;
-        return (void*)hooked_ShowDialog;
-    }
-    return addr;
-}
-
-struct Rebinding {
-    const char* name;
-    void* replacement;
-    void** replaced;
-};
-
-static void RebindSymbolsForImage(const struct mach_header* header, intptr_t slide) {
-    if (!header || header->magic != MH_MAGIC_64) return;
-    const auto* header64 = reinterpret_cast<const struct mach_header_64*>(header);
-
-    Dl_info info;
-    if (dladdr((const void*)header, &info) && info.dli_fname && strstr(info.dli_fname, "LuaLoader") != nullptr) {
-        return;
-    }
-
-    std::vector<Rebinding> rebindings = {
-        {"dlsym", (void*)hooked_dlsym, (void**)&orig_dlsym},
-        {"Java_com_arizona_game_GTASA_OnInputEnd", (void*)hooked_OnInputEnd, (void**)&orig_OnInputEnd},
-        {"_ZN4CNetGame11SendCommandEPKc", (void*)hooked_SendCommand, (void**)&orig_SendCommand},
-        {"_ZN4CNetGame8SendChatEPKc", (void*)hooked_SendChat, (void**)&orig_SendChat},
-        {"_ZN11CChatWindow14AddChatMessageEjPKc", (void*)hooked_AddChatMessage, (void**)&orig_AddChatMessage},
-        {"_ZN7CDialog4ShowEiiPKcS1_S1_S1_b", (void*)hooked_ShowDialog, (void**)&orig_ShowDialog}
-    };
-
-    const struct segment_command_64* linkeditSeg = nullptr;
-    const struct symtab_command* symtabCmd = nullptr;
-    const struct dysymtab_command* dysymtabCmd = nullptr;
-
-    uintptr_t cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header64->ncmds; i++) {
-        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
-            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkeditSeg = seg;
-        } else if (cmd->cmd == LC_SYMTAB) {
-            symtabCmd = reinterpret_cast<const struct symtab_command*>(cmd);
-        } else if (cmd->cmd == LC_DYSYMTAB) {
-            dysymtabCmd = reinterpret_cast<const struct dysymtab_command*>(cmd);
-        }
-        cur += cmd->cmdsize;
-    }
-
-    if (!linkeditSeg || !symtabCmd || !dysymtabCmd || dysymtabCmd->nindirectsyms == 0) return;
-
-    uintptr_t linkeditBase = static_cast<uintptr_t>(slide) + linkeditSeg->vmaddr - linkeditSeg->fileoff;
-    const auto* symtab = reinterpret_cast<const struct nlist_64*>(linkeditBase + symtabCmd->symoff);
-    const char* strtab = reinterpret_cast<const char*>(linkeditBase + symtabCmd->stroff);
-    const uint32_t* indirectSymtab = reinterpret_cast<const uint32_t*>(linkeditBase + dysymtabCmd->indirectsymoff);
-
-    cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header64->ncmds; i++) {
-        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
-            if (strcmp(seg->segname, SEG_DATA) == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
-                const auto* sects = reinterpret_cast<const struct section_64*>(cur + sizeof(struct segment_command_64));
-                for (uint32_t j = 0; j < seg->nsects; j++) {
-                    uint32_t type = sects[j].flags & SECTION_TYPE;
-                    if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-
-                    uint32_t indirectOffset = sects[j].reserved1;
-                    size_t count = sects[j].size / sizeof(void*);
-                    void** bindings = reinterpret_cast<void**>(static_cast<uintptr_t>(slide) + sects[j].addr);
-
-                    for (size_t k = 0; k < count; k++) {
-                        uint32_t symIdx = indirectSymtab[indirectOffset + k];
-                        if (symIdx == INDIRECT_SYMBOL_ABS || symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-                        uint32_t strOffset = symtab[symIdx].n_un.n_strx;
-                        if (strOffset == 0) continue;
-                        const char* symName = strtab + strOffset;
-                        if (symName[0] == '_') symName++;
-
-                        for (const auto& reb : rebindings) {
-                            if (strcmp(symName, reb.name) == 0) {
-                                if (reb.replaced && *reb.replaced == nullptr && bindings[k] != reb.replacement) {
-                                    *reb.replaced = bindings[k];
-                                }
-                                bindings[k] = reb.replacement;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        cur += cmd->cmdsize;
-    }
-}
-
-typedef BOOL (*Fn_TextFieldShouldReturn)(id, SEL, UITextField*);
-typedef void (*Fn_InsertText)(id, SEL, NSString*);
-
-static std::unordered_map<Class, Fn_TextFieldShouldReturn> g_OrigShouldReturnMap;
-static std::unordered_map<Class, Fn_InsertText> g_OrigInsertTextMap;
-
-static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField* textField) {
-    if (textField && textField.text.length > 0) {
-        std::string txt([textField.text UTF8String]);
-        if (TryExecuteChatCommand(txt, "UIKit-ShouldReturn")) {
-            textField.text = @"";
-            g_LiveKeyboardBuffer.clear();
-            [textField resignFirstResponder];
-            return NO;
-        }
-    }
-    g_LiveKeyboardBuffer.clear();
-    Class cls = object_getClass(self);
-    auto it = g_OrigShouldReturnMap.find(cls);
-    if (it != g_OrigShouldReturnMap.end() && it->second) {
-        return it->second(self, _cmd, textField);
-    }
-    return YES;
-}
-
-static void swizzled_insertText(id self, SEL _cmd, NSString* text) {
-    if (text && text.length > 0) {
-        std::string utf8([text UTF8String]);
-        if (utf8.find('\n') != std::string::npos || utf8.find('\r') != std::string::npos) {
-            std::string candidate = g_LiveKeyboardBuffer;
-            if ([self respondsToSelector:@selector(text)]) {
-                NSString* cur = [(id)self performSelector:@selector(text)];
-                if ([cur isKindOfClass:[NSString class]] && cur.length > 0) {
-                    candidate = [cur UTF8String];
-                }
-            }
-            g_LiveKeyboardBuffer.clear();
-
-            if (!candidate.empty() && TryExecuteChatCommand(candidate, "UIKit-InsertReturn")) {
-                if ([self respondsToSelector:@selector(setText:)]) {
-                    [(id)self performSelector:@selector(setText:) withObject:@""];
-                }
-                if ([self respondsToSelector:@selector(resignFirstResponder)]) {
-                    [(id)self resignFirstResponder];
-                }
-                return;
-            }
-        } else {
-            g_LiveKeyboardBuffer += utf8;
-        }
-    }
-
-    Class cls = object_getClass(self);
-    auto it = g_OrigInsertTextMap.find(cls);
-    if (it != g_OrigInsertTextMap.end() && it->second) {
-        it->second(self, _cmd, text);
-    }
-}
-
-static void SwizzleAppInputClasses() {
-    NSString* mainBundlePath = [[NSBundle mainBundle] bundlePath];
-    unsigned int numClasses = 0;
-    Class* classes = objc_copyClassList(&numClasses);
-    if (!classes) return;
-
-    for (unsigned int i = 0; i < numClasses; i++) {
-        Class cls = classes[i];
-        const char* img = class_getImageName(cls);
-        if (!img || strncmp(img, [mainBundlePath UTF8String], mainBundlePath.length) != 0) {
-            continue;
-        }
-
-        Method mRet = class_getInstanceMethod(cls, @selector(textFieldShouldReturn:));
-        if (mRet && method_getImplementation(mRet) != (IMP)swizzled_textFieldShouldReturn) {
-            g_OrigShouldReturnMap[cls] = (Fn_TextFieldShouldReturn)method_getImplementation(mRet);
-            method_setImplementation(mRet, (IMP)swizzled_textFieldShouldReturn);
-        }
-
-        Method mIns = class_getInstanceMethod(cls, @selector(insertText:));
-        if (mIns && method_getImplementation(mIns) != (IMP)swizzled_insertText) {
-            g_OrigInsertTextMap[cls] = (Fn_InsertText)method_getImplementation(mIns);
-            method_setImplementation(mIns, (IMP)swizzled_insertText);
-        }
-    }
-    free(classes);
-}
-
-static void InstallNativeHooks() {
-    _dyld_register_func_for_add_image(RebindSymbolsForImage);
-    SwizzleAppInputClasses();
+static void InstallPassiveUIKitObservers() {
+    static std::atomic<bool> installed{false};
+    bool expected = false;
+    if (!installed.compare_exchange_strong(expected, true)) return;
 
     NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
-
     [nc addObserverForName:UITextFieldTextDidChangeNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification* note) {
         UITextField* tf = note.object;
-        if ([tf isKindOfClass:[UITextField class]]) {
-            g_ChatInputText = tf.text ? [tf.text UTF8String] : "";
-            g_IsChatInputActive = true;
-            g_LiveKeyboardBuffer = g_ChatInputText;
-        }
+        if (![tf isKindOfClass:[UITextField class]]) return;
+        g_ChatInputText = tf.text ? [tf.text UTF8String] : "";
+        g_IsChatInputActive = true;
     }];
 
     [nc addObserverForName:UITextViewTextDidChangeNotification
@@ -888,38 +542,23 @@ static void InstallNativeHooks() {
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification* note) {
         UITextView* tv = note.object;
-        if ([tv isKindOfClass:[UITextView class]]) {
-            g_ChatInputText = tv.text ? [tv.text UTF8String] : "";
-            g_IsChatInputActive = true;
-            g_LiveKeyboardBuffer = g_ChatInputText;
-        }
+        if (![tv isKindOfClass:[UITextView class]]) return;
+        g_ChatInputText = tv.text ? [tv.text UTF8String] : "";
+        g_IsChatInputActive = true;
     }];
 
     [nc addObserverForName:UITextFieldTextDidEndEditingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification* note) {
+                usingBlock:^(NSNotification*) {
         g_IsChatInputActive = false;
-        UITextField* tf = note.object;
-        if ([tf isKindOfClass:[UITextField class]] && tf.text.length > 0) {
-            std::string txt([tf.text UTF8String]);
-            if (TryExecuteChatCommand(txt, "UIKit-DidEndEditing")) {
-                tf.text = @"";
-                g_LiveKeyboardBuffer.clear();
-            }
-        }
     }];
 
-    [nc addObserverForName:UIKeyboardWillHideNotification
+    [nc addObserverForName:UITextViewTextDidEndEditingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification* note) {
+                usingBlock:^(NSNotification*) {
         g_IsChatInputActive = false;
-        if (!g_LiveKeyboardBuffer.empty()) {
-            if (TryExecuteChatCommand(g_LiveKeyboardBuffer, "UIKit-KeyboardHide")) {
-                g_LiveKeyboardBuffer.clear();
-            }
-        }
     }];
 }
 
@@ -1048,10 +687,8 @@ static int l_sampAddChatMessage(lua_State* L) {
         g_Notifications.push_back({"42Loader", utf8, NowMs() + 4500});
     }
 
-    if (orig_AddChatMessage) {
-        std::string cp = Utf8ToCp1251(utf8);
-        orig_AddChatMessage(nullptr, color, cp.c_str());
-    }
+    // Until the real Arizona chat-window instance/API is identified, keep
+    // this message in the loader's own history instead of calling a guessed ABI.
     LogConsole("[Chat] " + utf8);
     return 0;
 }
@@ -1093,29 +730,28 @@ static int l_sampShowDialog(lua_State* L) {
         g_CurrentDialogText = uText;
     }
 
-    if (orig_ShowDialog) {
-        orig_ShowDialog(nullptr, id, style,
-                        Utf8ToCp1251(uTitle).c_str(),
-                        Utf8ToCp1251(uText).c_str(),
-                        Utf8ToCp1251(uBtn1).c_str(),
-                        Utf8ToCp1251(uBtn2).c_str(), false);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
-                                                                           message:[NSString stringWithUTF8String:uText.c_str()]
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
-            if (!uBtn2.empty()) {
-                [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
-                                                          style:UIAlertActionStyleCancel
-                                                        handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
-            }
-            UIWindow* win = GetActiveKeyWindow();
-            [win.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = GetActiveKeyWindow();
+        UIViewController* presenter = win.rootViewController;
+        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+        if (!presenter) {
+            g_IsDialogActive = false;
+            return;
+        }
+
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
+                                                                       message:[NSString stringWithUTF8String:uText.c_str()]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction*) { g_IsDialogActive = false; }]];
+        if (!uBtn2.empty()) {
+            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:^(UIAlertAction*) { g_IsDialogActive = false; }]];
+        }
+        [presenter presentViewController:alert animated:YES completion:nil];
+    });
     return 0;
 }
 
@@ -1781,6 +1417,12 @@ static void LoadSingleScript(LuaScriptInstance* inst) {
     }
 
     lua_State* L = luaL_newstate();
+    if (!L) {
+        inst->hasError = true;
+        inst->lastError = "Не удалось создать Lua state (недостаточно памяти)";
+        LogConsole("[ERROR] " + inst->lastError);
+        return;
+    }
     inst->L = L;
     RegisterAllLuaAPI(L, inst->filename, inst->fullPath);
 
@@ -2038,7 +1680,7 @@ static void RenderLoaderUI() {
 
         } else if (g_SelectedTab == 1) {
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted("Открытие меню: кнопка '42' или команды /42, /42loader, /luasettings в чате. Команды скриптов:");
+            ImGui::TextWrapped("Меню: плавающая кнопка 42. Команды можно проверить здесь или вызвать через sampProcessChatInput. Нативный перехват игрового чата пока отключён до подтверждения ABI Arizona iOS.");
             ImGui::PopTextWrapPos();
             ImGui::Separator();
 
@@ -2092,70 +1734,136 @@ static void RenderLoaderUI() {
 // ============================================================================
 
 static bool g_ImGuiInitialized = false;
+static void (*orig_presentDrawable)(id, SEL, id<MTLDrawable>) = nullptr;
 
 static void SetupImGuiWithDevice(id<MTLDevice> device) {
     if (g_ImGuiInitialized || !device) return;
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-    ImGui_ImplMetal_Init(device);
+    if (!ImGui_ImplMetal_Init(device)) {
+        ImGui::DestroyContext();
+        LogConsole("[Metal] ImGui_ImplMetal_Init failed");
+        return;
+    }
     g_ImGuiInitialized = true;
+    LogConsole("[Metal] Dear ImGui initialized");
 }
 
-static void (*orig_presentDrawable)(id, SEL, id<MTLDrawable>) = nullptr;
 static void swizzled_presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
-    EnsureFloatingMenuButton();
-
-    if (g_ImGuiInitialized) {
+    if (g_ImGuiInitialized && drawable) {
         UIWindow* keyWin = GetActiveKeyWindow();
-        if (keyWin) {
+        id<MTLTexture> texture = nil;
+        if ([(id)drawable respondsToSelector:@selector(texture)]) {
+            texture = [(id)drawable texture];
+        }
+        if (keyWin && texture) {
             ImGuiIO& io = ImGui::GetIO();
             CGFloat scale = [UIScreen mainScreen].scale;
             io.DisplaySize = ImVec2(keyWin.bounds.size.width, keyWin.bounds.size.height);
             io.DisplayFramebufferScale = ImVec2(scale, scale);
 
             MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-            if ([drawable respondsToSelector:@selector(texture)]) {
-                rpd.colorAttachments[0].texture = [(id)drawable texture];
-                rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.colorAttachments[0].texture = texture;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-                id<MTLCommandBuffer> cmdBuf = (id<MTLCommandBuffer>)self;
-                id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+            id<MTLCommandBuffer> commandBuffer = (id<MTLCommandBuffer>)self;
+            id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
+            if (encoder) {
                 ImGui_ImplMetal_NewFrame(rpd);
                 ImGui::NewFrame();
                 RenderLoaderUI();
                 ImGui::Render();
-                ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmdBuf, enc);
-                [enc endEncoding];
+                ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, encoder);
+                [encoder endEncoding];
             }
         }
     }
-    if (orig_presentDrawable) {
-        orig_presentDrawable(self, _cmd, drawable);
+
+    if (orig_presentDrawable) orig_presentDrawable(self, _cmd, drawable);
+}
+
+static void InstallMetalPresentHook() {
+    bool expected = false;
+    if (!g_MetalHookInstalled.compare_exchange_strong(expected, true)) return;
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        g_MetalHookInstalled.store(false);
+        LogConsole("[Metal] No default Metal device");
+        return;
     }
+
+    SetupImGuiWithDevice(device);
+    if (!g_ImGuiInitialized) {
+        g_MetalHookInstalled.store(false);
+        return;
+    }
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> probe = [queue commandBuffer];
+    if (!probe) {
+        g_MetalHookInstalled.store(false);
+        LogConsole("[Metal] Could not create command-buffer probe");
+        return;
+    }
+
+    Class commandBufferClass = object_getClass(probe);
+    SEL selector = @selector(presentDrawable:);
+    Method method = class_getInstanceMethod(commandBufferClass, selector);
+    if (!method) {
+        g_MetalHookInstalled.store(false);
+        LogConsole("[Metal] presentDrawable: method not found");
+        return;
+    }
+
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)swizzled_presentDrawable) {
+        orig_presentDrawable = nullptr;
+        LogConsole("[Metal] presentDrawable: already hooked");
+        return;
+    }
+
+    orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))current;
+    method_setImplementation(method, (IMP)swizzled_presentDrawable);
+    LogConsole("[Metal] presentDrawable: hook installed after UIApplication became active");
+}
+
+static void InitializeLoaderAfterLaunch() {
+    bool expected = false;
+    if (!g_LoaderStarted.compare_exchange_strong(expected, true)) return;
+
+    EnsureDirectories();
+    InstallPassiveUIKitObservers();
+    EnsureFloatingMenuButton();
+    ReloadAllScripts();
+
+    // Delay Metal runtime setup until UIKit has completed activation.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        InstallMetalPresentHook();
+        LogConsole("42Loader bootstrap complete (safe hooks mode)");
+    });
 }
 
 __attribute__((constructor))
 static void LoaderEntry() {
-    EnsureDirectories();
-    InstallNativeHooks();
+    // Do not touch UIApplication, Objective-C classes, dyld image tables,
+    // or Metal from the constructor's loader-lock context.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+        [center addObserverForName:UIApplicationDidBecomeActiveNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification*) {
+            InitializeLoaderAfterLaunch();
+        }];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        EnsureFloatingMenuButton();
-        ReloadAllScripts();
-
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        SetupImGuiWithDevice(dev);
-
-        id<MTLCommandQueue> queue = [dev newCommandQueue];
-        id<MTLCommandBuffer> buf = [queue commandBuffer];
-        Class cmdBufClass = [buf class];
-        Method m = class_getInstanceMethod(cmdBufClass, @selector(presentDrawable:));
-        if (m) {
-            orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))method_getImplementation(m);
-            method_setImplementation(m, (IMP)swizzled_presentDrawable);
+        UIApplication* app = [UIApplication sharedApplication];
+        if (app.applicationState == UIApplicationStateActive) {
+            InitializeLoaderAfterLaunch();
         }
-        LogConsole("Arizona 42Loader инициализирован (Кнопка '42' + Команды чата + Баннер активны)");
     });
 }
