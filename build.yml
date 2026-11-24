@@ -1,0 +1,124 @@
+name: Build LuaLoader.dylib (iOS arm64)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Apple toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
+
+      - name: Download and prepare Lua 5.4.7
+        run: |
+          set -euo pipefail
+          mkdir -p build/lua
+          curl --fail --location --silent --show-error \
+            https://www.lua.org/ftp/lua-5.4.7.tar.gz \
+            --output lua-5.4.7.tar.gz
+          tar -xzf lua-5.4.7.tar.gz
+          cp lua-5.4.7/src/*.c lua-5.4.7/src/*.h lua-5.4.7/src/lua.hpp build/lua/
+          rm -f build/lua/lua.c build/lua/luac.c
+          # Disable os.execute/system on the embedded iOS Lua runtime.
+          sed -i '' 's/#define l_system(cmd).*/#define l_system(cmd) ((cmd) == NULL ? 0 : -1)/g' build/lua/loslib.c
+          test -s build/lua/lua.h
+          test -s build/lua/loslib.c
+
+      - name: Download Dear ImGui 1.91.6
+        run: |
+          set -euo pipefail
+          mkdir -p build/imgui/backends
+          curl --fail --location --silent --show-error \
+            https://github.com/ocornut/imgui/archive/refs/tags/v1.91.6.tar.gz \
+            --output imgui.tar.gz
+          tar -xzf imgui.tar.gz
+          cp imgui-1.91.6/*.cpp imgui-1.91.6/*.h build/imgui/
+          cp imgui-1.91.6/backends/imgui_impl_metal.h \
+             imgui-1.91.6/backends/imgui_impl_metal.mm build/imgui/backends/
+          test -s build/imgui/imgui.h
+          test -s build/imgui/backends/imgui_impl_metal.mm
+
+      - name: Compile Lua and Dear ImGui for iOS arm64
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p build/obj/lua build/obj/imgui
+
+          for f in build/lua/*.c; do
+            name="$(basename "$f" .c)"
+            clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+              -O2 -DLUA_USE_IOS -Ibuild/lua \
+              -c "$f" -o "build/obj/lua/${name}.o"
+          done
+
+          for f in \
+            build/imgui/imgui.cpp \
+            build/imgui/imgui_draw.cpp \
+            build/imgui/imgui_tables.cpp \
+            build/imgui/imgui_widgets.cpp; do
+            name="$(basename "$f" .cpp)"
+            clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+              -std=c++17 -O2 -Ibuild/imgui \
+              -c "$f" -o "build/obj/imgui/${name}.o"
+          done
+
+          clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+            -std=c++17 -fobjc-arc -O2 \
+            -Ibuild/imgui -Ibuild/imgui/backends \
+            -c build/imgui/backends/imgui_impl_metal.mm \
+            -o build/obj/imgui/imgui_impl_metal.o
+
+      - name: Build LuaLoader.dylib
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          test -s src/loader.mm
+
+          clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=13.0 \
+            -dynamiclib -std=c++17 -fobjc-arc -O2 \
+            -Wno-deprecated-declarations \
+            -install_name @executable_path/Frameworks/LuaLoader.dylib \
+            -Ibuild/lua -Ibuild/imgui -Ibuild/imgui/backends \
+            src/loader.mm build/obj/lua/*.o build/obj/imgui/*.o \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -framework Metal \
+            -framework MetalKit \
+            -framework UserNotifications \
+            -o LuaLoader.dylib
+
+          test -s LuaLoader.dylib
+          file LuaLoader.dylib
+          lipo -verify_arch arm64 LuaLoader.dylib
+
+      - name: Ad-hoc sign and inspect dylib
+        run: |
+          set -euo pipefail
+          codesign --force --sign - --timestamp=none LuaLoader.dylib
+          codesign --verify --verbose=2 LuaLoader.dylib
+          codesign -dv --verbose=4 LuaLoader.dylib 2>&1
+          otool -L LuaLoader.dylib
+
+      - name: Upload LuaLoader.dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LuaLoader-ios-arm64
+          path: LuaLoader.dylib
+          if-no-files-found: error
