@@ -181,11 +181,11 @@ static std::string g_CurrentDialogButton2;
 static std::thread::id g_LuaOwnerThread;
 static bool g_PendingReload = true;
 static bool g_OwnerThreadWarningLogged = false;
+static bool g_LastRenderedMenuOpen = false;
 
 static ImVec4 g_AccentColor = ImVec4(0.62f, 0.38f, 0.95f, 1.0f);
 
 static UIButton* g_FloatingMenuButton = nullptr;
-static UIButton* g_SecondaryFloatingMenuButton = nullptr;
 static CGFloat g_OverlayDisplayWidth = 0;
 static CGFloat g_OverlayDisplayHeight = 0;
 static CGFloat g_OverlayScale = 1;
@@ -267,12 +267,6 @@ static void RefreshFloatingButtonTheme() {
         g_FloatingMenuButton.backgroundColor = open
             ? LoaderAccentUIColor()
             : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-        if (g_SecondaryFloatingMenuButton) {
-            g_SecondaryFloatingMenuButton.layer.borderColor = LoaderAccentUIColor().CGColor;
-            g_SecondaryFloatingMenuButton.backgroundColor = open
-                ? LoaderAccentUIColor()
-                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-        }
     });
 }
 
@@ -353,16 +347,11 @@ static void ToggleLoaderMenu() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIColor* accent = LoaderAccentUIColor();
         if (g_FloatingMenuButton) {
+            g_FloatingMenuButton.hidden = isOpen;
             g_FloatingMenuButton.backgroundColor = isOpen
                 ? accent
                 : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
             g_FloatingMenuButton.layer.borderColor = accent.CGColor;
-        }
-        if (g_SecondaryFloatingMenuButton) {
-            g_SecondaryFloatingMenuButton.backgroundColor = isOpen
-                ? accent
-                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-            g_SecondaryFloatingMenuButton.layer.borderColor = accent.CGColor;
         }
     });
 }
@@ -415,17 +404,11 @@ static void ToggleLoaderMenu() {
 
 @interface LoaderFloatingBtnHandler : NSObject
 + (void)onTap:(UIButton*)sender;
-+ (void)onTap24:(UIButton*)sender;
 + (void)onPan:(UIPanGestureRecognizer*)pan;
 @end
 
 @implementation LoaderFloatingBtnHandler
 + (void)onTap:(UIButton*)sender {
-    (void)sender;
-    ToggleLoaderMenu();
-}
-
-+ (void)onTap24:(UIButton*)sender {
     (void)sender;
     ToggleLoaderMenu();
 }
@@ -491,36 +474,12 @@ static void EnsureFloatingMenuButton() {
             g_FloatingMenuButton = btn;
         }
 
-        if (!g_SecondaryFloatingMenuButton) {
-            UIButton* btn24 = [UIButton buttonWithType:UIButtonTypeCustom];
-            btn24.tag = 242400;
-            btn24.frame = CGRectMake(18.0, 108.0, 48.0, 48.0);
-            btn24.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-            btn24.layer.cornerRadius = 24.0;
-            btn24.layer.borderWidth = 1.5;
-            btn24.layer.borderColor = LoaderAccentUIColor().CGColor;
-            btn24.layer.shadowColor = [UIColor blackColor].CGColor;
-            btn24.layer.shadowOpacity = 0.45;
-            btn24.layer.shadowRadius = 6.0;
-            btn24.layer.shadowOffset = CGSizeMake(0, 2);
-            [btn24 setTitle:@"24" forState:UIControlStateNormal];
-            [btn24 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-            btn24.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
-            btn24.accessibilityLabel = @"Open or close 42Loader menu";
-            [btn24 addTarget:[LoaderFloatingBtnHandler class]
-                      action:@selector(onTap24:)
-            forControlEvents:UIControlEventTouchUpInside];
-            g_SecondaryFloatingMenuButton = btn24;
-        }
-
         if (g_ImGuiTouchView.superview != win) {
             g_ImGuiTouchView.frame = win.bounds;
             [win addSubview:g_ImGuiTouchView];
         }
         if (g_FloatingMenuButton.superview != win) [win addSubview:g_FloatingMenuButton];
-        if (g_SecondaryFloatingMenuButton.superview != win) [win addSubview:g_SecondaryFloatingMenuButton];
         [win bringSubviewToFront:g_FloatingMenuButton];
-        [win bringSubviewToFront:g_SecondaryFloatingMenuButton];
     };
     if ([NSThread isMainThread]) ensureButton();
     else dispatch_async(dispatch_get_main_queue(), ensureButton);
@@ -2058,17 +2017,6 @@ static void RenderLoaderUI() {
     float screenW = io.DisplaySize.x;
     float screenH = io.DisplaySize.y;
 
-    float totalLuaKB = 0.0f;
-    if (luaOwner) {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        for (auto* s : g_Scripts) {
-            if (s->L) totalLuaKB += static_cast<float>(lua_gc(s->L, LUA_GCCOUNT, 0));
-        }
-    }
-    char ramStr[96];
-    snprintf(ramStr, sizeof(ramStr), "Loader RAM: %.2f MB (Lua: %.0f KB)", GetLoaderRAM_MB(), totalLuaKB);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2(screenW - 245, screenH * 0.48f), IM_COL32(220, 220, 230, 180), ramStr);
-
     {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         uint64_t now = NowMs();
@@ -2312,6 +2260,7 @@ static void RenderLoaderUI() {
             ImGui::Text("42Loader | Lua 5.4 | Dear ImGui 1.91.6 | Metal");
             ImGui::Text("Scripts loaded: %zu | Errors: %zu | Disabled: %zu", loaded, errors, disabled);
             ImGui::Text("Registered local commands: %zu", g_ChatCommands.size());
+            ImGui::Text("Loader RAM: %.2f MB", GetLoaderRAM_MB());
             ImGui::Text("Script directory: Documents/lua_loader/scripts");
             ImGui::TextUnformatted("Arizona game chat bridge: NOT SUPPORTED (no matching exported chat symbols in bundled libag-client.dylib)");
             ImGui::TextUnformatted("Game memory, server commands, and game-state APIs are unavailable.");
@@ -2329,6 +2278,12 @@ static void RenderLoaderUI() {
     {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         g_MenuOpen = menuOpen;
+    }
+    if (menuOpen != g_LastRenderedMenuOpen) {
+        g_LastRenderedMenuOpen = menuOpen;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_FloatingMenuButton.hidden = menuOpen;
+        });
     }
     UpdateImGuiInteractiveRects();
     ImGui::PopStyleColor(5);
