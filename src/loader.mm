@@ -1057,7 +1057,7 @@ static void InstallSafeUIKitChatHooks() {
     [nc addObserverForName:UITextFieldTextDidEndEditingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
         g_IsChatInputActive = false;
         UITextField* tf = note.object;
-        NSNumber* reason = note.userInfo[UITextFieldDidEndEditingReasonUserInfoKey];
+        NSNumber* reason = note.userInfo[UITextFieldDidEndEditingReasonKey];
         BOOL committed = (reason != nil && [reason integerValue] == UITextFieldDidEndEditingReasonCommitted);
         if (committed && [tf isKindOfClass:[UITextField class]] && tf != g_MenuCmdField && tf.text.length > 0) {
             std::string txt([tf.text UTF8String]);
