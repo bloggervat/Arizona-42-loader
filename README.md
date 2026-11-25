@@ -10,7 +10,9 @@ GitHub Actions builds `LuaLoader.dylib` and a package containing the dylib and
 The original Arizona app bundle is not included. To create a local IPA with
 `compil.bat`, provide the extracted app under `Payload/Arizona.app`, place the
 built dylib in its `Frameworks/` folder and `LoaderLib/` beside it, and install
-Python with the `lief` package.
+Python with the `lief` package. The script outputs
+`Arizona_42loader_unsigned.ipa` for signing and filters out IDA databases and
+stale code-signature files.
 
 Dear ImGui and its Metal backend are compiled into the dylib so they use one
 native context. The bundled Lua modules do not contain Android binaries.
