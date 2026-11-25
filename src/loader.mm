@@ -172,11 +172,13 @@ static int g_CurrentDialogStyle = 0;
 static bool g_IsDialogActive = false;
 static std::string g_CurrentDialogTitle;
 static std::string g_CurrentDialogText;
+static std::string g_CurrentDialogButton1;
+static std::string g_CurrentDialogButton2;
 static std::thread::id g_LuaOwnerThread;
 static bool g_PendingReload = true;
 static bool g_OwnerThreadWarningLogged = false;
 
-static void ShowNativeLoaderMenu();
+static ImVec4 g_AccentColor = ImVec4(0.62f, 0.38f, 0.95f, 1.0f);
 
 static UIButton* g_FloatingMenuButton = nullptr;
 static CGFloat g_OverlayDisplayWidth = 0;
@@ -235,6 +237,30 @@ static void AddOverlayNotification(std::string title, std::string message, uint6
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     if (g_Notifications.size() >= 50) g_Notifications.erase(g_Notifications.begin());
     g_Notifications.push_back({std::move(title), std::move(message), NowMs() + lifetimeMs});
+}
+
+static UIColor* LoaderAccentUIColor() {
+    ImVec4 accent;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        accent = g_AccentColor;
+    }
+    return [UIColor colorWithRed:accent.x green:accent.y blue:accent.z alpha:accent.w];
+}
+
+static void RefreshFloatingButtonTheme() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_FloatingMenuButton) return;
+        g_FloatingMenuButton.layer.borderColor = LoaderAccentUIColor().CGColor;
+        bool open = false;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            open = g_MenuOpen;
+        }
+        g_FloatingMenuButton.backgroundColor = open
+            ? LoaderAccentUIColor()
+            : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+    });
 }
 
 static void LogConsole(const std::string& line);
@@ -314,10 +340,12 @@ static void ToggleLoaderMenu() {
             std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
             isOpen = g_MenuOpen;
         }
+        UIColor* accent = LoaderAccentUIColor();
         if (g_FloatingMenuButton) {
             g_FloatingMenuButton.backgroundColor = isOpen
-                ? [UIColor colorWithRed:0.52 green:0.26 blue:0.88 alpha:0.95]
+                ? accent
                 : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+            g_FloatingMenuButton.layer.borderColor = accent.CGColor;
         }
     });
 }
@@ -340,7 +368,7 @@ static void ToggleLoaderMenu() {
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event {
     (void)point; (void)event;
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    if (g_MenuOpen) return YES;
+    if (g_MenuOpen || g_IsDialogActive) return YES;
     for (const CGRect& rect : g_ImGuiInteractiveRects) {
         if (CGRectContainsPoint(rect, point)) return YES;
     }
@@ -377,7 +405,6 @@ static void ToggleLoaderMenu() {
 + (void)onTap:(UIButton*)sender {
     (void)sender;
     ToggleLoaderMenu();
-    ShowNativeLoaderMenu();
 }
 
 + (void)onPan:(UIPanGestureRecognizer*)pan {
@@ -429,7 +456,7 @@ static void EnsureFloatingMenuButton() {
         btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
         btn.layer.cornerRadius = 24.0;
         btn.layer.borderWidth = 1.5;
-        btn.layer.borderColor = [UIColor colorWithRed:0.62 green:0.38 blue:0.95 alpha:0.95].CGColor;
+        btn.layer.borderColor = LoaderAccentUIColor().CGColor;
         btn.layer.shadowColor = [UIColor blackColor].CGColor;
         btn.layer.shadowOpacity = 0.45;
         btn.layer.shadowRadius = 6.0;
@@ -460,77 +487,26 @@ static void EnsureFloatingMenuButton() {
 }
 
 static void ShowLauncherBanner(NSString* message, BOOL isError) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetActiveKeyWindow();
-        if (!win) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                ShowLauncherBanner(message, isError);
-            });
-            return;
-        }
+    if (!message) return;
+    AddOverlayNotification(isError ? "42Loader error" : "42Loader",
+                           Cp1251ToUtf8(message.UTF8String ?: ""), 5000);
+}
 
-        EnsureFloatingMenuButton();
+static void LoadAccentColorPreference() {
+    NSArray* values = [[NSUserDefaults standardUserDefaults] objectForKey:@"Arizona42LoaderAccentRGBA"];
+    if (![values isKindOfClass:[NSArray class]] || values.count != 4) return;
+    float rgba[4];
+    for (NSUInteger i = 0; i < 4; ++i) {
+        id item = values[i];
+        if (![item respondsToSelector:@selector(floatValue)]) return;
+        rgba[i] = std::max(0.0f, std::min(1.0f, [item floatValue]));
+    }
+    g_AccentColor = ImVec4(rgba[0], rgba[1], rgba[2], rgba[3]);
+}
 
-        UIView* old = [win viewWithTag:424242];
-        if (old) [old removeFromSuperview];
-
-        CGFloat screenW = win.bounds.size.width;
-        CGFloat bannerW = MIN(screenW - 32.0, 420.0);
-        CGFloat bannerH = 44.0;
-
-        UIView* banner = [[UIView alloc] initWithFrame:CGRectMake((screenW - bannerW) * 0.5, -60.0, bannerW, bannerH)];
-        banner.tag = 424242;
-        banner.backgroundColor = isError
-            ? [UIColor colorWithRed:0.35 green:0.10 blue:0.14 alpha:0.95]
-            : [UIColor colorWithRed:0.14 green:0.10 blue:0.24 alpha:0.95];
-        banner.layer.cornerRadius = 14.0;
-        banner.layer.borderWidth = 1.5;
-        banner.layer.borderColor = isError
-            ? [UIColor colorWithRed:0.95 green:0.30 blue:0.35 alpha:0.95].CGColor
-            : [UIColor colorWithRed:0.62 green:0.38 blue:0.95 alpha:0.95].CGColor;
-        banner.layer.shadowColor = [UIColor blackColor].CGColor;
-        banner.layer.shadowOpacity = 0.45;
-        banner.layer.shadowRadius = 8.0;
-        banner.layer.shadowOffset = CGSizeMake(0, 3);
-        banner.userInteractionEnabled = NO;
-
-        UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectInset(banner.bounds, 14.0, 4.0)];
-        lbl.text = message;
-        lbl.textColor = [UIColor whiteColor];
-        lbl.font = [UIFont boldSystemFontOfSize:13.0];
-        lbl.textAlignment = NSTextAlignmentCenter;
-        lbl.numberOfLines = 2;
-        lbl.adjustsFontSizeToFitWidth = YES;
-        lbl.minimumScaleFactor = 0.75;
-        [banner addSubview:lbl];
-
-        [win addSubview:banner];
-        [win bringSubviewToFront:banner];
-
-        CGFloat topInset = 18.0;
-        if (@available(iOS 11.0, *)) {
-            topInset = MAX(18.0, win.safeAreaInsets.top + 6.0);
-        }
-
-        [UIView animateWithDuration:0.35
-                              delay:0
-             usingSpringWithDamping:0.8
-              initialSpringVelocity:0.5
-                            options:UIViewAnimationOptionCurveEaseOut
-                         animations:^{
-            banner.frame = CGRectMake((screenW - bannerW) * 0.5, topInset, bannerW, bannerH);
-        } completion:^(BOOL finished) {
-            [UIView animateWithDuration:0.30
-                                  delay:3.8
-                                options:UIViewAnimationOptionCurveEaseIn
-                             animations:^{
-                banner.alpha = 0.0;
-                banner.frame = CGRectMake((screenW - bannerW) * 0.5, -60.0, bannerW, bannerH);
-            } completion:^(BOOL done) {
-                [banner removeFromSuperview];
-            }];
-        }];
-    });
+static void SaveAccentColorPreference() {
+    NSArray* values = @[@(g_AccentColor.x), @(g_AccentColor.y), @(g_AccentColor.z), @(g_AccentColor.w)];
+    [[NSUserDefaults standardUserDefaults] setObject:values forKey:@"Arizona42LoaderAccentRGBA"];
 }
 
 static void EnsureDirectories() {
@@ -862,18 +838,8 @@ static int l_sampIsChatCommandDefined(lua_State* L) {
 
 static int l_sampAddChatMessage(lua_State* L) {
     const char* text = luaL_checkstring(L, 1);
-    uint32_t color = static_cast<uint32_t>(luaL_optinteger(L, 2, 0xFFFFFFFF));
     std::string utf8 = Cp1251ToUtf8(text);
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        g_ChatHistory.push_back({utf8, "", color, color});
-        if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
-    }
-    AddOverlayNotification("42Loader", utf8, 4500);
-
-    // This is shown in the loader UI only; it is not written into the game chat.
-    LogConsole("[ChatBridge unavailable] Local message queued for Loader UI only: " + utf8);
+    LogConsole("[ChatBridge unavailable] sampAddChatMessage was not sent to game chat: " + utf8);
     lua_pushboolean(L, 0);
     lua_pushstring(L, "Arizona CChatWindow bridge is not verified");
     return 2;
@@ -911,32 +877,9 @@ static int l_sampShowDialog(lua_State* L) {
         g_IsDialogActive = true;
         g_CurrentDialogTitle = uTitle;
         g_CurrentDialogText = uText;
+        g_CurrentDialogButton1 = uBtn1.empty() ? "OK" : uBtn1;
+        g_CurrentDialogButton2 = uBtn2;
     }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
-                                                                           message:[NSString stringWithUTF8String:uText.c_str()]
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(UIAlertAction* _Nonnull) {
-                std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-                g_IsDialogActive = false;
-            }]];
-            if (!uBtn2.empty()) {
-                [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
-                                                          style:UIAlertActionStyleCancel
-                                                        handler:^(UIAlertAction* _Nonnull) {
-                    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-                    g_IsDialogActive = false;
-                }]];
-            }
-            UIWindow* win = GetActiveKeyWindow();
-            UIViewController* presenter = win.rootViewController;
-            while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
-                presenter = presenter.presentedViewController;
-            if (presenter) [presenter presentViewController:alert animated:YES completion:nil];
-        });
     return 0;
 }
 
@@ -2194,101 +2137,6 @@ static bool TickScripts() {
     return true;
 }
 
-static void ShowCommandPrompt() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetActiveKeyWindow();
-        UIViewController* presenter = win.rootViewController;
-        while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
-            presenter = presenter.presentedViewController;
-        if (!presenter) return;
-
-        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Run Loader command"
-                                                                       message:@"Enter a local command such as /t_help"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField* field) {
-            field.placeholder = @"/command arguments";
-            field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-            field.autocorrectionType = UITextAutocorrectionTypeNo;
-        }];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Run" style:UIAlertActionStyleDefault
-                                               handler:^(UIAlertAction* action) {
-            NSString* value = alert.textFields.firstObject.text ?: @"";
-            const char* utf8 = value.UTF8String;
-            if (!utf8 || !*utf8) return;
-            std::string input(utf8);
-            QueueLocalCommand(std::move(input));
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [presenter presentViewController:alert animated:YES completion:nil];
-    });
-}
-
-// Keep a native UIKit entry point available even when the host application's
-// Metal command-buffer implementation does not expose a hookable present method.
-// Lua callbacks are still only queued here and run later on TickScripts' owner thread.
-static void ShowNativeLoaderMenu() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetActiveKeyWindow();
-        UIViewController* presenter = win.rootViewController;
-        while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
-            presenter = presenter.presentedViewController;
-        if (!presenter || [presenter isBeingPresented]) return;
-
-        UIAlertController* menu = [UIAlertController alertControllerWithTitle:@"Arizona 42Loader"
-                                                                       message:@"Loader-local commands. Commands run on the Lua scheduler thread."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [menu addAction:[UIAlertAction actionWithTitle:@"Open full ImGui menu"
-                                                style:UIAlertActionStyleDefault
-                                              handler:nil]];
-        [menu addAction:[UIAlertAction actionWithTitle:@"Enter local command…"
-                                                style:UIAlertActionStyleDefault
-                                              handler:^(__unused UIAlertAction* action) {
-            ShowCommandPrompt();
-        }]];
-
-        std::vector<std::pair<std::string, std::string>> commands;
-        {
-            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-            commands.reserve(g_ChatCommands.size());
-            for (const auto& item : g_ChatCommands)
-                commands.emplace_back(item.first, item.second.scriptName);
-        }
-        const size_t visibleCommands = std::min<size_t>(commands.size(), 5);
-        for (size_t i = 0; i < visibleCommands; ++i) {
-            NSString* title = [NSString stringWithFormat:@"Run /%s  (%s)",
-                               commands[i].first.c_str(), commands[i].second.c_str()];
-            NSString* command = [NSString stringWithFormat:@"/%s", commands[i].first.c_str()];
-            [menu addAction:[UIAlertAction actionWithTitle:title
-                                                    style:UIAlertActionStyleDefault
-                                                  handler:^(__unused UIAlertAction* action) {
-                const char* utf8 = command.UTF8String;
-                if (utf8) QueueLocalCommand(std::string(utf8));
-            }]];
-        }
-        if (commands.size() > visibleCommands) {
-            NSString* more = [NSString stringWithFormat:@"%zu more commands in full menu", commands.size() - visibleCommands];
-            [menu addAction:[UIAlertAction actionWithTitle:more style:UIAlertActionStyleDefault handler:nil]];
-        }
-        [menu addAction:[UIAlertAction actionWithTitle:@"Reload Lua scripts"
-                                                style:UIAlertActionStyleDefault
-                                              handler:^(__unused UIAlertAction* action) {
-            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-            g_PendingReload = true;
-        }]];
-        [menu addAction:[UIAlertAction actionWithTitle:@"Close Loader menu"
-                                                style:UIAlertActionStyleCancel
-                                              handler:^(__unused UIAlertAction* action) {
-            bool isOpen = false;
-            {
-                std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-                isOpen = g_MenuOpen;
-            }
-            if (isOpen) ToggleLoaderMenu();
-        }]];
-        [presenter presentViewController:menu animated:YES completion:nil];
-    });
-}
-
 // ============================================================================
 // 8. DEAR IMGUI OVERLAY AND RENDER API
 // ============================================================================
@@ -2376,7 +2224,46 @@ static void RenderLoaderUI() {
     }
 
     RenderQueuedPrimitives();
-    UpdateImGuiInteractiveRects();
+
+    bool dialogActive = false;
+    std::string dialogTitle, dialogText, dialogButton1, dialogButton2;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        dialogActive = g_IsDialogActive;
+        if (dialogActive) {
+            dialogTitle = g_CurrentDialogTitle;
+            dialogText = g_CurrentDialogText;
+            dialogButton1 = g_CurrentDialogButton1;
+            dialogButton2 = g_CurrentDialogButton2;
+        }
+    }
+    if (dialogActive) {
+        ImGui::GetForegroundDrawList()->AddRectFilled(
+            ImVec2(0, 0), ImVec2(screenW, screenH), IM_COL32(0, 0, 0, 145));
+        ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f, screenH * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(std::min(420.0f, screenW - 32.0f), 0.0f), ImGuiCond_Always);
+        bool closeDialog = false;
+        if (ImGui::Begin("Lua dialog##42loader", nullptr,
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextColored(g_AccentColor, "%s", dialogTitle.c_str());
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(dialogText.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+            if (ImGui::Button(dialogButton1.c_str(), ImVec2(120.0f, 0.0f))) closeDialog = true;
+            if (!dialogButton2.empty()) {
+                ImGui::SameLine();
+                if (ImGui::Button(dialogButton2.c_str(), ImVec2(120.0f, 0.0f))) closeDialog = true;
+            }
+        }
+        ImGui::End();
+        if (closeDialog) {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            g_IsDialogActive = false;
+        }
+    }
 
     bool menuOpen = false;
     {
@@ -2384,6 +2271,7 @@ static void RenderLoaderUI() {
         menuOpen = g_MenuOpen;
     }
     if (!menuOpen) {
+        UpdateImGuiInteractiveRects();
         return;
     }
 
@@ -2391,8 +2279,11 @@ static void RenderLoaderUI() {
     const float menuHeight = std::max(240.0f, std::min(420.0f, screenH - 72.0f));
     ImGui::SetNextWindowPos(ImVec2((screenW - menuWidth) * 0.5f, 36.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(menuWidth, menuHeight), ImGuiCond_Always);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.32f, 0.18f, 0.52f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, g_AccentColor);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.09f, 0.14f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.32f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.62f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.88f));
 
     if (ImGui::Begin("Arizona 42Loader", &menuOpen)) {
         size_t scriptCount = 0;
@@ -2402,7 +2293,7 @@ static void RenderLoaderUI() {
             scriptCount = g_Scripts.size();
             commandCount = g_ChatCommands.size();
         }
-        ImGui::TextColored(ImVec4(0.72f, 0.52f, 1.0f, 1.0f), "42Loader");
+        ImGui::TextColored(g_AccentColor, "42Loader");
         ImGui::SameLine();
         ImGui::TextDisabled("%zu scripts  |  %zu local commands  |  %s",
                             scriptCount, commandCount,
@@ -2414,6 +2305,7 @@ static void RenderLoaderUI() {
             if (ImGui::BeginTabItem("Commands")) { g_SelectedTab = 1; ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Console")) { g_SelectedTab = 2; ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Status")) { g_SelectedTab = 3; ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Appearance")) { g_SelectedTab = 4; ImGui::EndTabItem(); }
             ImGui::EndTabBar();
         }
 
@@ -2473,7 +2365,8 @@ static void RenderLoaderUI() {
 
         } else if (g_SelectedTab == 1) {
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted("Commands are local to the Loader. Enter /name below; game chat commands are not hooked.");
+            ImGui::TextUnformatted("Registered Lua commands. Run executes callbacks on the Lua owner thread.");
+            ImGui::TextDisabled("Game chat registration/output is unavailable: no verified Arizona chat API was found.");
             ImGui::PopTextWrapPos();
             ImGui::Separator();
 
@@ -2492,9 +2385,6 @@ static void RenderLoaderUI() {
                 ImGui::EndDisabled();
                 ImGui::PopID();
             }
-
-            ImGui::Separator();
-            if (ImGui::Button("Enter command with keyboard")) ShowCommandPrompt();
 
         } else if (g_SelectedTab == 2) {
             if (ImGui::Button("Clear Console")) {
@@ -2517,10 +2407,27 @@ static void RenderLoaderUI() {
             ImGui::EndChild();
 
         } else if (g_SelectedTab == 3) {
+            size_t loaded = 0, errors = 0, disabled = 0;
+            for (const auto* script : g_Scripts) {
+                if (!script->enabled) ++disabled;
+                else if (script->hasError) ++errors;
+                else if (script->L) ++loaded;
+            }
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted("Game clock/weather bridge: unavailable (ABI not verified)");
-            ImGui::Text("Scripts: %zu | Local commands: %zu", g_Scripts.size(), g_ChatCommands.size());
+            ImGui::Text("42Loader | Lua 5.4 | Dear ImGui 1.91.6 | Metal");
+            ImGui::Text("Scripts loaded: %zu | Errors: %zu | Disabled: %zu", loaded, errors, disabled);
+            ImGui::Text("Registered local commands: %zu", g_ChatCommands.size());
+            ImGui::Text("Script directory: Documents/lua_loader/scripts");
+            ImGui::TextUnformatted("Arizona game chat bridge: NOT SUPPORTED (no matching exported chat symbols in bundled libag-client.dylib)");
+            ImGui::TextUnformatted("Game memory, server commands, and game-state APIs are unavailable.");
             ImGui::PopTextWrapPos();
+        } else if (g_SelectedTab == 4) {
+            ImGui::TextUnformatted("Loader theme");
+            if (ImGui::ColorEdit4("Accent color", &g_AccentColor.x, ImGuiColorEditFlags_AlphaBar)) {
+                SaveAccentColorPreference();
+                RefreshFloatingButtonTheme();
+            }
+            ImGui::TextDisabled("Color is saved on this device.");
         }
     }
     ImGui::End();
@@ -2529,7 +2436,7 @@ static void RenderLoaderUI() {
         g_MenuOpen = menuOpen;
     }
     UpdateImGuiInteractiveRects();
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor(5);
 }
 
 // ============================================================================
@@ -2628,6 +2535,7 @@ static void LoaderEntry() {
     EnsureDirectories();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        LoadAccentColorPreference();
         EnsureFloatingMenuButton();
         // Lua state creation and script chunk execution belong to TickScripts.
         // It runs on the Metal scheduler thread and performs the initial load
