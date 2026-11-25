@@ -148,6 +148,11 @@ struct ImGuiTouchEvent {
     bool down = false;
 };
 
+struct PendingLocalCommand {
+    std::string text;
+    std::string source;
+};
+
 static std::recursive_mutex g_EngineMutex;
 static size_t g_TotalLuaBytes = 0;
 static const size_t kLuaProcessMemoryLimit = 128 * 1024 * 1024;
@@ -155,7 +160,7 @@ static std::vector<LuaScriptInstance*> g_Scripts;
 static uint64_t g_NextScriptId = 1;
 static uint64_t g_NextThreadHandle = 1;
 static std::deque<HttpCompletion> g_HttpCompletions;
-static std::deque<std::string> g_PendingCommands;
+static std::deque<PendingLocalCommand> g_PendingCommands;
 static std::unordered_map<std::string, RegisteredCommand> g_ChatCommands;
 static std::vector<std::string> g_ConsoleLogs;
 static std::vector<ChatHistoryEntry> g_ChatHistory;
@@ -272,13 +277,13 @@ static void RefreshFloatingButtonTheme() {
 
 static void LogConsole(const std::string& line);
 
-static void QueueLocalCommand(std::string command) {
+static void QueueLocalCommand(std::string command, const char* source = "CommandPrompt") {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     if (g_PendingCommands.size() >= 128) {
         LogConsole("[WARN] Local command queue full; command dropped");
         return;
     }
-    g_PendingCommands.push_back(std::move(command));
+    g_PendingCommands.push_back({std::move(command), source ? source : "unknown"});
 }
 
 static void LuaInstructionLimit(lua_State* L, lua_Debug* debug);
@@ -605,6 +610,16 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     LogConsole(std::string("[Command:") + sourceTag + "] Ran /" + key + " (" + cmdArgs + ")");
 
     RegisteredCommand reg = it->second;
+    if (g_LuaOwnerThread != std::this_thread::get_id()) {
+        if (g_PendingCommands.size() >= 128) {
+            LogConsole("[WARN] Local command queue full; command dropped");
+            return true;
+        }
+        g_PendingCommands.push_back({utf8, sourceTag ? sourceTag : "unknown"});
+        LogConsole("[Command] Queued /" + key + " for the Lua owner thread");
+        return true;
+    }
+
     if (reg.L && reg.funcRef != LUA_NOREF) {
         lua_State* L = reg.L;
         lua_rawgeti(L, LUA_REGISTRYINDEX, reg.funcRef);
@@ -1898,9 +1913,9 @@ static bool TickScripts() {
         ReloadAllScripts();
     }
     while (!g_PendingCommands.empty()) {
-        std::string command = std::move(g_PendingCommands.front());
+        PendingLocalCommand command = std::move(g_PendingCommands.front());
         g_PendingCommands.pop_front();
-        TryExecuteChatCommand(command, "CommandPrompt");
+        TryExecuteChatCommand(command.text, command.source.c_str());
     }
 
     uint64_t now = NowMs();
