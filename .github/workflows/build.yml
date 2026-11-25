@@ -84,7 +84,7 @@ jobs:
         run: |
           mkdir -p build/package/Frameworks
           cp LuaLoader.dylib build/package/Frameworks/
-          cp -R Payload/Arizona.app/LoaderLib build/package/
+          cp -R LoaderLib build/package/
           (cd build/package && zip -qr "$GITHUB_WORKSPACE/LuaLoader-ios-arm64-package.zip" Frameworks LoaderLib)
           unzip -l LuaLoader-ios-arm64-package.zip
 

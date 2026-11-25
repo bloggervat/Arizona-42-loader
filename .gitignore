@@ -1,0 +1,7 @@
+# Local build outputs and app payload
+/build/
+/Payload/
+*.ipa
+*.dylib
+*.o
+LuaLoader-ios-arm64-package.zip
