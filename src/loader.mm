@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -26,6 +27,7 @@ extern "C" {
 }
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_metal.h"
 
 // ============================================================================
@@ -152,12 +154,14 @@ static std::vector<LuaScriptInstance*> g_Scripts;
 static uint64_t g_NextScriptId = 1;
 static uint64_t g_NextThreadHandle = 1;
 static std::deque<HttpCompletion> g_HttpCompletions;
+static std::deque<std::string> g_PendingCommands;
 static std::unordered_map<std::string, RegisteredCommand> g_ChatCommands;
 static std::vector<std::string> g_ConsoleLogs;
 static std::vector<ChatHistoryEntry> g_ChatHistory;
 static std::vector<OverlayNotification> g_Notifications;
 static std::vector<RenderCommand> g_RenderCommands;
 static std::vector<ImGuiTouchEvent> g_ImGuiTouchEvents;
+static std::vector<CGRect> g_ImGuiInteractiveRects;
 static UIView* g_ImGuiTouchView = nil;
 
 static bool g_MenuOpen = false;
@@ -168,8 +172,9 @@ static int g_CurrentDialogStyle = 0;
 static bool g_IsDialogActive = false;
 static std::string g_CurrentDialogTitle;
 static std::string g_CurrentDialogText;
-static std::string g_LastInterceptedCmd;
-static uint64_t g_LastInterceptedMs = 0;
+static std::thread::id g_LuaOwnerThread;
+static bool g_PendingReload = true;
+static bool g_OwnerThreadWarningLogged = false;
 
 static UIButton* g_FloatingMenuButton = nullptr;
 static CGFloat g_OverlayDisplayWidth = 0;
@@ -228,6 +233,15 @@ static void AddOverlayNotification(std::string title, std::string message, uint6
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     if (g_Notifications.size() >= 50) g_Notifications.erase(g_Notifications.begin());
     g_Notifications.push_back({std::move(title), std::move(message), NowMs() + lifetimeMs});
+}
+
+static void QueueLocalCommand(std::string command) {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    if (g_PendingCommands.size() >= 128) {
+        LogConsole("[WARN] Local command queue full; command dropped");
+        return;
+    }
+    g_PendingCommands.push_back(std::move(command));
 }
 
 static void LuaInstructionLimit(lua_State* L, lua_Debug* debug);
@@ -322,7 +336,11 @@ static void ToggleLoaderMenu() {
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent*)event {
     (void)point; (void)event;
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    return g_MenuOpen;
+    if (g_MenuOpen) return YES;
+    for (const CGRect& rect : g_ImGuiInteractiveRects) {
+        if (CGRectContainsPoint(rect, point)) return YES;
+    }
+    return NO;
 }
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
     (void)event;
@@ -420,6 +438,11 @@ static void EnsureFloatingMenuButton() {
 
         UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:[LoaderFloatingBtnHandler class]
                                                                               action:@selector(onPan:)];
+        // Keep UIButton's touch-up-inside action alive when the drag recognizer
+        // decides that a stationary press was not a drag.
+        pan.cancelsTouchesInView = NO;
+        pan.delaysTouchesBegan = NO;
+        pan.delaysTouchesEnded = NO;
         [btn addGestureRecognizer:pan];
 
         [win addSubview:btn];
@@ -568,11 +591,6 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
         return false;
     }
 
-    uint64_t now = NowMs();
-    if (utf8 == g_LastInterceptedCmd && (now - g_LastInterceptedMs) < 350) {
-        return true;
-    }
-
     std::string withoutSlash = utf8.substr(1);
     std::string cmdName;
     std::string cmdArgs;
@@ -592,8 +610,6 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
 
     // Built-in loader menu commands (/42, /42loader, /luasettings)
     if (key == "42" || key == "42loader" || key == "luasettings") {
-        g_LastInterceptedCmd = utf8;
-        g_LastInterceptedMs = now;
         ToggleLoaderMenu();
         LogConsole(std::string("[Command:") + sourceTag + "] Loader menu toggled with /" + key);
         return true;
@@ -605,8 +621,6 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
         return false;
     }
 
-    g_LastInterceptedCmd = utf8;
-    g_LastInterceptedMs = now;
     LogConsole(std::string("[Command:") + sourceTag + "] Ran /" + key + " (" + cmdArgs + ")");
 
     RegisteredCommand reg = it->second;
@@ -2065,8 +2079,28 @@ static void ReloadAllScripts() {
     ShowLauncherBanner(bannerMsg, errCount > 0);
 }
 
-static void TickScripts() {
+static bool TickScripts() {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    const std::thread::id currentThread = std::this_thread::get_id();
+    if (g_LuaOwnerThread == std::thread::id()) g_LuaOwnerThread = currentThread;
+    if (currentThread != g_LuaOwnerThread) {
+        if (!g_OwnerThreadWarningLogged) {
+            g_OwnerThreadWarningLogged = true;
+            LogConsole("[ERROR] Metal render callback moved threads; Lua callbacks are paused to protect Lua state ownership");
+        }
+        return false;
+    }
+
+    if (g_PendingReload) {
+        g_PendingReload = false;
+        ReloadAllScripts();
+    }
+    while (!g_PendingCommands.empty()) {
+        std::string command = std::move(g_PendingCommands.front());
+        g_PendingCommands.pop_front();
+        TryExecuteChatCommand(command, "CommandPrompt");
+    }
+
     uint64_t now = NowMs();
 
     while (!g_HttpCompletions.empty()) {
@@ -2151,6 +2185,7 @@ static void TickScripts() {
             }
         }
     }
+    return true;
 }
 
 static void ShowCommandPrompt() {
@@ -2175,9 +2210,7 @@ static void ShowCommandPrompt() {
             const char* utf8 = value.UTF8String;
             if (!utf8 || !*utf8) return;
             std::string input(utf8);
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                TryExecuteChatCommand(input, "CommandPrompt");
-            });
+            QueueLocalCommand(std::move(input));
         }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [presenter presentViewController:alert animated:YES completion:nil];
@@ -2188,15 +2221,31 @@ static void ShowCommandPrompt() {
 // 8. DEAR IMGUI OVERLAY AND RENDER API
 // ============================================================================
 
+static void UpdateImGuiInteractiveRects() {
+    std::vector<CGRect> rects;
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (context) {
+        rects.reserve(context->Windows.Size);
+        for (int i = 0; i < context->Windows.Size; ++i) {
+            ImGuiWindow* window = context->Windows[i];
+            if (!window || !window->Active || window->LastFrameActive != context->FrameCount ||
+                (window->Flags & ImGuiWindowFlags_NoInputs)) continue;
+            rects.push_back(CGRectMake(window->Pos.x, window->Pos.y, window->Size.x, window->Size.y));
+        }
+    }
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    g_ImGuiInteractiveRects.swap(rects);
+}
+
 static void RenderLoaderUI() {
-    TickScripts();
+    const bool luaOwner = TickScripts();
 
     ImGuiIO& io = ImGui::GetIO();
     float screenW = io.DisplaySize.x;
     float screenH = io.DisplaySize.y;
 
     float totalLuaKB = 0.0f;
-    {
+    if (luaOwner) {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         for (auto* s : g_Scripts) {
             if (s->L) totalLuaKB += static_cast<float>(lua_gc(s->L, LUA_GCCOUNT, 0));
@@ -2233,7 +2282,7 @@ static void RenderLoaderUI() {
         }
     }
 
-    {
+    if (luaOwner) {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         for (auto* s : g_Scripts) {
             if (s->enabled && s->L && !s->hasError && s->renderCallbackRef != LUA_NOREF) {
@@ -2255,41 +2304,65 @@ static void RenderLoaderUI() {
     }
 
     RenderQueuedPrimitives();
+    UpdateImGuiInteractiveRects();
 
     bool menuOpen = false;
     {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         menuOpen = g_MenuOpen;
     }
-    if (!menuOpen) return;
+    if (!menuOpen) {
+        return;
+    }
 
-    ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f - 260.0f, 36.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 310.0f), ImGuiCond_FirstUseEver);
+    const float menuWidth = std::max(280.0f, std::min(520.0f, screenW - 24.0f));
+    const float menuHeight = std::max(240.0f, std::min(420.0f, screenH - 72.0f));
+    ImGui::SetNextWindowPos(ImVec2((screenW - menuWidth) * 0.5f, 36.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(menuWidth, menuHeight), ImGuiCond_Always);
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.32f, 0.18f, 0.52f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.09f, 0.14f, 0.95f));
 
-    if (ImGui::Begin("Arizona 42Loader  |  Lua 5.4 + MoonLoader API", &menuOpen)) {
-        if (ImGui::Button("Scripts")) g_SelectedTab = 0;
+    if (ImGui::Begin("Arizona 42Loader", &menuOpen)) {
+        size_t scriptCount = 0;
+        size_t commandCount = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            scriptCount = g_Scripts.size();
+            commandCount = g_ChatCommands.size();
+        }
+        ImGui::TextColored(ImVec4(0.72f, 0.52f, 1.0f, 1.0f), "42Loader");
         ImGui::SameLine();
-        if (ImGui::Button("Commands")) g_SelectedTab = 1;
-        ImGui::SameLine();
-        if (ImGui::Button("Console")) g_SelectedTab = 2;
-        ImGui::SameLine();
-        if (ImGui::Button("Settings")) g_SelectedTab = 3;
+        ImGui::TextDisabled("%zu scripts  |  %zu local commands  |  %s",
+                            scriptCount, commandCount,
+                            luaOwner ? "Lua ready" : "Lua paused: render thread changed");
+        ImGui::Separator();
+
+        if (ImGui::BeginTabBar("##LoaderTabs")) {
+            if (ImGui::BeginTabItem("Scripts")) { g_SelectedTab = 0; ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Commands")) { g_SelectedTab = 1; ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Console")) { g_SelectedTab = 2; ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Status")) { g_SelectedTab = 3; ImGui::EndTabItem(); }
+            ImGui::EndTabBar();
+        }
 
         ImGui::Separator();
 
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
 
         if (g_SelectedTab == 0) {
+            ImGui::BeginDisabled(!luaOwner);
             if (ImGui::Button("Reload All Scripts")) {
-                ReloadAllScripts();
+                g_PendingReload = true;
             }
             ImGui::SameLine();
             ImGui::TextDisabled("Dir: Documents/lua_loader/scripts");
             ImGui::Separator();
 
             ImGui::BeginChild("##ScriptsList", ImVec2(0, 0), false);
+            if (g_Scripts.empty()) {
+                ImGui::TextDisabled("No Lua scripts found.");
+                ImGui::TextWrapped("Copy scripts into Documents/lua_loader/scripts, then reload.");
+            }
             for (size_t i = 0; i < g_Scripts.size(); i++) {
                 LuaScriptInstance* s = g_Scripts[i];
                 ImGui::PushID(static_cast<int>(i));
@@ -2324,6 +2397,7 @@ static void RenderLoaderUI() {
                 ImGui::PopID();
             }
             ImGui::EndChild();
+            ImGui::EndDisabled();
 
         } else if (g_SelectedTab == 1) {
             ImGui::PushTextWrapPos(0.0f);
@@ -2334,13 +2408,16 @@ static void RenderLoaderUI() {
             std::vector<std::string> commandNames;
             commandNames.reserve(g_ChatCommands.size());
             for (const auto& command : g_ChatCommands) commandNames.push_back(command.first);
+            if (commandNames.empty()) ImGui::TextDisabled("No local commands are registered.");
             for (const auto& name : commandNames) {
                 auto it = g_ChatCommands.find(name);
                 if (it == g_ChatCommands.end()) continue;
                 ImGui::BulletText("/%s  (%s)", name.c_str(), it->second.scriptName.c_str());
                 ImGui::SameLine();
                 ImGui::PushID(name.c_str());
-                if (ImGui::Button("Run")) TryExecuteChatCommand("/" + name, "CommandTab");
+                ImGui::BeginDisabled(!luaOwner);
+                if (ImGui::Button("Run")) QueueLocalCommand("/" + name);
+                ImGui::EndDisabled();
                 ImGui::PopID();
             }
 
@@ -2379,6 +2456,7 @@ static void RenderLoaderUI() {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         g_MenuOpen = menuOpen;
     }
+    UpdateImGuiInteractiveRects();
     ImGui::PopStyleColor(2);
 }
 
@@ -2387,6 +2465,7 @@ static void RenderLoaderUI() {
 // ============================================================================
 
 static bool g_ImGuiInitialized = false;
+static uint64_t g_ImGuiFrameCount = 0;
 
 static void SetupImGuiWithDevice(id<MTLDevice> device) {
     if (g_ImGuiInitialized || !device) return;
@@ -2400,8 +2479,8 @@ static void SetupImGuiWithDevice(id<MTLDevice> device) {
     g_ImGuiInitialized = true;
 }
 
-static void (*orig_presentDrawable)(id, SEL, id<MTLDrawable>) = nullptr;
-static void swizzled_presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
+static void RenderImGuiOverlay(id self, id<MTLDrawable> drawable) {
+    if (!g_ImGuiInitialized || !drawable) return;
     if (g_ImGuiInitialized) {
         ImGuiIO& io = ImGui::GetIO();
         CGFloat width, height, scale;
@@ -2431,13 +2510,45 @@ static void swizzled_presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable
                     ImGui::Render();
                     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmdBuf, enc);
                     [enc endEncoding];
+                    if ((++g_ImGuiFrameCount % 600) == 1) {
+                        LogConsole("[ImGui] Metal overlay rendering frames");
+                    }
                 }
             }
         }
     }
-    if (orig_presentDrawable) {
-        orig_presentDrawable(self, _cmd, drawable);
+}
+
+using PresentDrawableFn = void (*)(id, SEL, id<MTLDrawable>);
+using PresentDrawableAtTimeFn = void (*)(id, SEL, id<MTLDrawable>, CFTimeInterval);
+using PresentDrawableAfterDurationFn = void (*)(id, SEL, id<MTLDrawable>, CFTimeInterval);
+static PresentDrawableFn orig_presentDrawable = nullptr;
+static PresentDrawableAtTimeFn orig_presentDrawableAtTime = nullptr;
+static PresentDrawableAfterDurationFn orig_presentDrawableAfterDuration = nullptr;
+
+static void swizzled_presentDrawable(id self, SEL cmd, id<MTLDrawable> drawable) {
+    RenderImGuiOverlay(self, drawable);
+    if (orig_presentDrawable) orig_presentDrawable(self, cmd, drawable);
+}
+static void swizzled_presentDrawableAtTime(id self, SEL cmd, id<MTLDrawable> drawable, CFTimeInterval time) {
+    RenderImGuiOverlay(self, drawable);
+    if (orig_presentDrawableAtTime) orig_presentDrawableAtTime(self, cmd, drawable, time);
+}
+static void swizzled_presentDrawableAfterDuration(id self, SEL cmd, id<MTLDrawable> drawable, CFTimeInterval duration) {
+    RenderImGuiOverlay(self, drawable);
+    if (orig_presentDrawableAfterDuration) orig_presentDrawableAfterDuration(self, cmd, drawable, duration);
+}
+
+static bool InstallPresentHook(Class cls, SEL selector, IMP replacement, IMP& original) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return false;
+    IMP previous = method_getImplementation(method);
+    if (class_addMethod(cls, selector, replacement, method_getTypeEncoding(method))) {
+        original = previous;
+    } else {
+        original = method_setImplementation(method, replacement);
     }
+    return original != nullptr;
 }
 
 __attribute__((constructor))
@@ -2446,25 +2557,43 @@ static void LoaderEntry() {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         EnsureFloatingMenuButton();
-        ReloadAllScripts();
+        // Lua state creation and script chunk execution belong to TickScripts.
+        // It runs on the Metal scheduler thread and performs the initial load
+        // through g_PendingReload, keeping all Lua access on one owner thread.
 
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) {
+            LogConsole("[ERROR] Metal device unavailable; overlay renderer was not initialized");
+            return;
+        }
         SetupImGuiWithDevice(dev);
+        if (!g_ImGuiInitialized) {
+            LogConsole("[ERROR] ImGui Metal backend initialization failed");
+            return;
+        }
 
         id<MTLCommandQueue> queue = [dev newCommandQueue];
         id<MTLCommandBuffer> buf = [queue commandBuffer];
-        Class cmdBufClass = [buf class];
-        SEL presentSelector = @selector(presentDrawable:);
-        Method m = class_getInstanceMethod(cmdBufClass, presentSelector);
-        if (m) {
-            IMP original = method_getImplementation(m);
-            if (class_addMethod(cmdBufClass, presentSelector, (IMP)swizzled_presentDrawable, method_getTypeEncoding(m))) {
-                orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))original;
-            } else {
-                original = method_setImplementation(m, (IMP)swizzled_presentDrawable);
-                orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))original;
-            }
+        if (!queue || !buf) {
+            LogConsole("[ERROR] Unable to create Metal command queue for hook discovery");
+            return;
         }
+        Class cmdBufClass = [buf class];
+        // Install exactly one selector. Some Metal implementations chain the
+        // timed variants through presentDrawable:, so hooking all three can
+        // submit the ImGui draw list more than once for the same frame.
+        IMP originalPresent = nullptr;
+        bool hooked = InstallPresentHook(cmdBufClass, @selector(presentDrawable:), (IMP)swizzled_presentDrawable, originalPresent);
+        if (hooked) orig_presentDrawable = (PresentDrawableFn)originalPresent;
+        if (!hooked) {
+            hooked = InstallPresentHook(cmdBufClass, @selector(presentDrawable:atTime:), (IMP)swizzled_presentDrawableAtTime, originalPresent);
+            if (hooked) orig_presentDrawableAtTime = (PresentDrawableAtTimeFn)originalPresent;
+        }
+        if (!hooked) {
+            hooked = InstallPresentHook(cmdBufClass, @selector(presentDrawable:afterMinimumDuration:), (IMP)swizzled_presentDrawableAfterDuration, originalPresent);
+            if (hooked) orig_presentDrawableAfterDuration = (PresentDrawableAfterDurationFn)originalPresent;
+        }
+        LogConsole(hooked ? "[ImGui] Metal present hook installed" : "[ERROR] No supported Metal present selector found");
         LogConsole("Arizona 42Loader initialized");
     });
 }
