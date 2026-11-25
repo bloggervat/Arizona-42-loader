@@ -1,12 +1,7 @@
 #import <UIKit/UIKit.h>
-#import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-#import <dlfcn.h>
 
 #include <string>
 #include <vector>
@@ -24,35 +19,8 @@ extern "C" {
 #include "lauxlib.h"
 }
 
-#include "imgui.h"
-#include "imgui_impl_metal.h"
-
 // ============================================================================
-// 1. JNI / SAMP / DYSYM HOOK TYPES
-// ============================================================================
-
-typedef void* JNIEnv;
-typedef void* jobject;
-typedef void* jbyteArray;
-
-typedef void* (*Fn_dlsym)(void* handle, const char* symbol);
-typedef void (*Fn_OnInputEnd)(JNIEnv* env, jobject thiz, jbyteArray array);
-typedef void (*Fn_SendCommand)(void* thisPtr, const char* cmd);
-typedef void (*Fn_SendChat)(void* thisPtr, const char* msg);
-typedef void (*Fn_AddChatMessage)(void* thisPtr, uint32_t color, const char* text);
-typedef void (*Fn_ShowDialog)(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b);
-
-static Fn_dlsym orig_dlsym = nullptr;
-static Fn_OnInputEnd orig_OnInputEnd = nullptr;
-static Fn_SendCommand orig_SendCommand = nullptr;
-static Fn_SendChat orig_SendChat = nullptr;
-static Fn_AddChatMessage orig_AddChatMessage = nullptr;
-static Fn_ShowDialog orig_ShowDialog = nullptr;
-
-static void* g_LastNetGamePtr = nullptr;
-
-// ============================================================================
-// 2. ENCODING HELPERS (CP1251 <-> UTF-8)
+// 1. ENCODING HELPERS (CP1251 <-> UTF-8)
 // ============================================================================
 
 static std::string ToLowerASCII(const std::string& s) {
@@ -97,32 +65,8 @@ static std::string Cp1251ToUtf8(const std::string& str) {
     return out;
 }
 
-static std::string Utf8ToCp1251(const std::string& str) {
-    std::string out;
-    out.reserve(str.size());
-    size_t i = 0;
-    while (i < str.size()) {
-        unsigned char c = static_cast<unsigned char>(str[i]);
-        if (c < 0x80) {
-            out.push_back(static_cast<char>(c));
-            i++;
-        } else if ((c >> 5) == 0x6 && i + 1 < str.size()) {
-            uint16_t cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(str[i + 1]) & 0x3F);
-            if (cp == 0x0401) out.push_back(static_cast<char>(0xA8));
-            else if (cp == 0x0451) out.push_back(static_cast<char>(0xB8));
-            else if (cp >= 0x0410 && cp <= 0x044F) out.push_back(static_cast<char>(0xC0 + (cp - 0x0410)));
-            else out.push_back('?');
-            i += 2;
-        } else {
-            out.push_back('?');
-            i++;
-        }
-    }
-    return out;
-}
-
 // ============================================================================
-// 3. DATA STRUCTURES & GLOBAL STATE
+// 2. DATA STRUCTURES & GLOBAL STATE
 // ============================================================================
 
 struct LuaCoroutine {
@@ -157,22 +101,14 @@ struct LuaScriptInstance {
     int renderCallbackRef = LUA_NOREF;
 };
 
-struct OverlayNotification {
-    std::string title;
-    std::string message;
-    uint64_t expireMs;
-};
-
 static std::recursive_mutex g_EngineMutex;
 static std::vector<LuaScriptInstance*> g_Scripts;
 static std::unordered_map<std::string, RegisteredCommand> g_ChatCommands;
 static std::vector<std::string> g_ConsoleLogs;
 static std::vector<ChatHistoryEntry> g_ChatHistory;
-static std::vector<OverlayNotification> g_Notifications;
 
 static bool g_MenuOpen = false;
 static int g_SelectedTab = 0;
-static char g_CmdInputBuf[256] = {0};
 
 static int g_CurrentDialogId = -1;
 static int g_CurrentDialogStyle = 0;
@@ -187,7 +123,26 @@ static int g_WorldWeather = 1;
 
 static std::string g_LastInterceptedCmd;
 static uint64_t g_LastInterceptedMs = 0;
-static UIButton* g_FloatingMenuButton = nullptr;
+static __weak UIView* g_ActiveInputView = nil;
+
+// Native UIKit views
+static UIButton* g_FloatingMenuButton = nil;
+static UIView* g_MenuOverlayView = nil;
+static UILabel* g_MenuRamLabel = nil;
+static UISegmentedControl* g_MenuTabs = nil;
+static UIScrollView* g_MenuScrollView = nil;
+static UITextField* g_MenuCmdField = nil;
+static UIView* g_MenuCmdBar = nil;
+static UIButton* g_MenuActionBtn = nil;
+static CADisplayLink* g_DisplayLink = nil;
+static uint64_t g_LastUiRefreshMs = 0;
+
+// Script ImGui-compat native window
+static UIView* g_ScriptImGuiWindow = nil;
+static UILabel* g_ScriptImGuiTitle = nil;
+static UIStackView* g_ScriptImGuiStack = nil;
+static bool g_ScriptImGuiBuilding = false;
+static bool g_ScriptImGuiVisibleThisFrame = false;
 
 static uint64_t NowMs() {
     using namespace std::chrono;
@@ -205,11 +160,22 @@ static std::string ShortenPathForUI(const std::string& raw) {
     return (pos != std::string::npos) ? raw.substr(pos + 1) : raw;
 }
 
+static float GetLoaderRAM_MB() {
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count) == KERN_SUCCESS) {
+        return static_cast<float>(vmInfo.phys_footprint) / (1024.0f * 1024.0f);
+    }
+    return 0.0f;
+}
+
 static void LogConsole(const std::string& line) {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     std::string clean = ShortenPathForUI(line);
     g_ConsoleLogs.push_back(clean);
-    if (g_ConsoleLogs.size() > 300) g_ConsoleLogs.erase(g_ConsoleLogs.begin());
+    if (g_ConsoleLogs.size() > 300) {
+        g_ConsoleLogs.erase(g_ConsoleLogs.begin());
+    }
     NSLog(@"[42Loader] %s", clean.c_str());
 
     std::string logPath = GetBaseDir() + "/loader.log";
@@ -233,141 +199,10 @@ static UIWindow* GetActiveKeyWindow() {
             }
         }
     }
-    if (!found) found = [[UIApplication sharedApplication] keyWindow];
+    if (!found) {
+        found = [[UIApplication sharedApplication] keyWindow];
+    }
     return found;
-}
-
-static void ToggleLoaderMenu() {
-    g_MenuOpen = !g_MenuOpen;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_FloatingMenuButton) {
-            g_FloatingMenuButton.backgroundColor = g_MenuOpen
-                ? [UIColor colorWithRed:0.52 green:0.26 blue:0.88 alpha:0.95]
-                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-        }
-    });
-}
-
-// ============================================================================
-// 4. FLOATING UIKIT BUTTON "42" & LAUNCHER BANNER
-// ============================================================================
-
-@interface LoaderFloatingBtnHandler : NSObject
-+ (void)onTap:(UIButton*)sender;
-+ (void)onPan:(UIPanGestureRecognizer*)pan;
-@end
-
-@implementation LoaderFloatingBtnHandler
-+ (void)onTap:(UIButton*)sender {
-    ToggleLoaderMenu();
-}
-+ (void)onPan:(UIPanGestureRecognizer*)pan {
-    UIView* btn = pan.view;
-    UIView* parent = btn.superview;
-    if (!btn || !parent) return;
-    CGPoint delta = [pan translationInView:parent];
-    CGPoint center = CGPointMake(btn.center.x + delta.x, btn.center.y + delta.y);
-    CGFloat halfW = btn.bounds.size.width * 0.5;
-    CGFloat halfH = btn.bounds.size.height * 0.5;
-    center.x = MAX(halfW + 6.0, MIN(parent.bounds.size.width - halfW - 6.0, center.x));
-    center.y = MAX(halfH + 6.0, MIN(parent.bounds.size.height - halfH - 6.0, center.y));
-    btn.center = center;
-    [pan setTranslation:CGPointZero inView:parent];
-}
-@end
-
-static void EnsureFloatingMenuButton() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetActiveKeyWindow();
-        if (!win) return;
-
-        if (g_FloatingMenuButton) {
-            if (g_FloatingMenuButton.superview != win) [win addSubview:g_FloatingMenuButton];
-            [win bringSubviewToFront:g_FloatingMenuButton];
-            return;
-        }
-
-        UIButton* btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.tag = 424200;
-        btn.frame = CGRectMake(18.0, 52.0, 48.0, 48.0);
-        btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-        btn.layer.cornerRadius = 24.0;
-        btn.layer.borderWidth = 1.5;
-        btn.layer.borderColor = [UIColor colorWithRed:0.62 green:0.38 blue:0.95 alpha:0.95].CGColor;
-        [btn setTitle:@"42" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
-
-        [btn addTarget:[LoaderFloatingBtnHandler class] action:@selector(onTap:) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:[LoaderFloatingBtnHandler class] action:@selector(onPan:)];
-        [btn addGestureRecognizer:pan];
-
-        [win addSubview:btn];
-        [win bringSubviewToFront:btn];
-        g_FloatingMenuButton = btn;
-    });
-}
-
-static void ShowLauncherBanner(NSString* message, BOOL isError) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow* win = GetActiveKeyWindow();
-        if (!win) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                ShowLauncherBanner(message, isError);
-            });
-            return;
-        }
-
-        EnsureFloatingMenuButton();
-
-        UIView* old = [win viewWithTag:424242];
-        if (old) [old removeFromSuperview];
-
-        CGFloat screenW = win.bounds.size.width;
-        CGFloat bannerW = MIN(screenW - 32.0, 420.0);
-        CGFloat bannerH = 44.0;
-
-        UIView* banner = [[UIView alloc] initWithFrame:CGRectMake((screenW - bannerW) * 0.5, -60.0, bannerW, bannerH)];
-        banner.tag = 424242;
-        banner.backgroundColor = isError
-            ? [UIColor colorWithRed:0.35 green:0.10 blue:0.14 alpha:0.95]
-            : [UIColor colorWithRed:0.14 green:0.10 blue:0.24 alpha:0.95];
-        banner.layer.cornerRadius = 14.0;
-        banner.layer.borderWidth = 1.5;
-        banner.layer.borderColor = isError
-            ? [UIColor colorWithRed:0.95 green:0.30 blue:0.35 alpha:0.95].CGColor
-            : [UIColor colorWithRed:0.62 green:0.38 blue:0.95 alpha:0.95].CGColor;
-        banner.userInteractionEnabled = NO;
-
-        UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectInset(banner.bounds, 14.0, 4.0)];
-        lbl.text = message;
-        lbl.textColor = [UIColor whiteColor];
-        lbl.font = [UIFont boldSystemFontOfSize:13.0];
-        lbl.textAlignment = NSTextAlignmentCenter;
-        lbl.numberOfLines = 2;
-        lbl.adjustsFontSizeToFitWidth = YES;
-        lbl.minimumScaleFactor = 0.75;
-        [banner addSubview:lbl];
-
-        [win addSubview:banner];
-        [win bringSubviewToFront:banner];
-
-        CGFloat topInset = 18.0;
-        if (@available(iOS 11.0, *)) {
-            topInset = MAX(18.0, win.safeAreaInsets.top + 6.0);
-        }
-
-        [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.5 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            banner.frame = CGRectMake((screenW - bannerW) * 0.5, topInset, bannerW, bannerH);
-        } completion:^(BOOL finished) {
-            [UIView animateWithDuration:0.30 delay:3.8 options:UIViewAnimationOptionCurveEaseIn animations:^{
-                banner.alpha = 0.0;
-                banner.frame = CGRectMake((screenW - bannerW) * 0.5, -60.0, bannerW, bannerH);
-            } completion:^(BOOL done) {
-                [banner removeFromSuperview];
-            }];
-        }];
-    });
 }
 
 static void EnsureDirectories() {
@@ -395,35 +230,99 @@ static LuaScriptInstance* FindScriptByState(lua_State* L) {
     return nullptr;
 }
 
+// Forward declarations
+static void ReloadAllScripts();
+static void LoadSingleScript(LuaScriptInstance* inst);
+static void UnloadSingleScript(LuaScriptInstance* inst);
+static void RefreshMenuContent();
+static void ToggleLoaderMenu();
+
 // ============================================================================
-// 5. OUTGOING CHAT & COMMAND INTERCEPTION
+// 3. TOP BANNER & IN-GAME CHAT TOAST NOTIFICATIONS
 // ============================================================================
 
-static void SendRawToGameChat(const std::string& utf8Text) {
-    std::string cpText = Utf8ToCp1251(utf8Text);
+static void ShowBannerOnWindow(NSString* title, NSString* message, uint32_t accentHex, NSTimeInterval duration, NSInteger tag) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = GetActiveKeyWindow();
+        if (!win) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                ShowBannerOnWindow(title, message, accentHex, duration, tag);
+            });
+            return;
+        }
 
-    if (!cpText.empty() && cpText[0] == '/' && orig_SendCommand && g_LastNetGamePtr) {
-        orig_SendCommand(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-    if (orig_SendChat && g_LastNetGamePtr) {
-        orig_SendChat(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
+        UIView* old = [win viewWithTag:tag];
+        if (old) [old removeFromSuperview];
 
-    Fn_SendCommand dynSendCmd = (Fn_SendCommand)dlsym(RTLD_DEFAULT, "_ZN4CNetGame11SendCommandEPKc");
-    Fn_SendChat dynSendChat = (Fn_SendChat)dlsym(RTLD_DEFAULT, "_ZN4CNetGame8SendChatEPKc");
+        CGFloat screenW = win.bounds.size.width;
+        CGFloat bannerW = MIN(screenW - 32.0, 440.0);
+        CGFloat bannerH = (title.length > 0) ? 54.0 : 44.0;
+        CGFloat yOffset = (tag == 424242) ? 0.0 : 52.0;
 
-    if (!cpText.empty() && cpText[0] == '/' && dynSendCmd && g_LastNetGamePtr) {
-        dynSendCmd(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-    if (dynSendChat && g_LastNetGamePtr) {
-        dynSendChat(g_LastNetGamePtr, cpText.c_str());
-        return;
-    }
-    LogConsole("[ChatOut -> Server] " + utf8Text);
+        UIView* banner = [[UIView alloc] initWithFrame:CGRectMake((screenW - bannerW) * 0.5, -70.0, bannerW, bannerH)];
+        banner.tag = tag;
+        banner.backgroundColor = [UIColor colorWithRed:0.12 green:0.09 blue:0.20 alpha:0.95];
+        banner.layer.cornerRadius = 14.0;
+        banner.layer.borderWidth = 1.5;
+
+        CGFloat r = ((accentHex >> 16) & 0xFF) / 255.0;
+        CGFloat g = ((accentHex >> 8) & 0xFF) / 255.0;
+        CGFloat b = (accentHex & 0xFF) / 255.0;
+        if (accentHex == 0) { r = 0.62; g = 0.38; b = 0.95; }
+        banner.layer.borderColor = [UIColor colorWithRed:r green:g blue:b alpha:0.95].CGColor;
+        banner.userInteractionEnabled = NO;
+
+        if (title.length > 0) {
+            UILabel* titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(14.0, 6.0, bannerW - 28.0, 18.0)];
+            titleLbl.text = title;
+            titleLbl.textColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+            titleLbl.font = [UIFont boldSystemFontOfSize:12.0];
+            [banner addSubview:titleLbl];
+
+            UILabel* bodyLbl = [[UILabel alloc] initWithFrame:CGRectMake(14.0, 24.0, bannerW - 28.0, 24.0)];
+            bodyLbl.text = message;
+            bodyLbl.textColor = [UIColor whiteColor];
+            bodyLbl.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+            bodyLbl.numberOfLines = 2;
+            bodyLbl.adjustsFontSizeToFitWidth = YES;
+            bodyLbl.minimumScaleFactor = 0.75;
+            [banner addSubview:bodyLbl];
+        } else {
+            UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectInset(banner.bounds, 14.0, 4.0)];
+            lbl.text = message;
+            lbl.textColor = [UIColor whiteColor];
+            lbl.font = [UIFont boldSystemFontOfSize:13.0];
+            lbl.textAlignment = NSTextAlignmentCenter;
+            lbl.numberOfLines = 2;
+            lbl.adjustsFontSizeToFitWidth = YES;
+            lbl.minimumScaleFactor = 0.75;
+            [banner addSubview:lbl];
+        }
+
+        [win addSubview:banner];
+        [win bringSubviewToFront:banner];
+
+        CGFloat topInset = 16.0;
+        if (@available(iOS 11.0, *)) {
+            topInset = MAX(16.0, win.safeAreaInsets.top + 6.0);
+        }
+
+        [UIView animateWithDuration:0.30 delay:0 usingSpringWithDamping:0.82 initialSpringVelocity:0.5 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            banner.frame = CGRectMake((screenW - bannerW) * 0.5, topInset + yOffset, bannerW, bannerH);
+        } completion:^(BOOL finished) {
+            [UIView animateWithDuration:0.25 delay:duration options:UIViewAnimationOptionCurveEaseIn animations:^{
+                banner.alpha = 0.0;
+                banner.frame = CGRectMake((screenW - bannerW) * 0.5, -70.0, bannerW, bannerH);
+            } completion:^(BOOL done) {
+                [banner removeFromSuperview];
+            }];
+        }];
+    });
 }
+
+// ============================================================================
+// 4. CHAT COMMAND EXECUTION ENGINE
+// ============================================================================
 
 static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourceTag = "unknown") {
     std::string utf8 = Cp1251ToUtf8(rawInput);
@@ -458,21 +357,24 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     std::string key = ToLowerASCII(cmdName);
     if (key.empty()) return false;
 
+    // Built-in commands to toggle loader menu
     if (key == "42" || key == "42loader" || key == "luasettings") {
         g_LastInterceptedCmd = utf8;
         g_LastInterceptedMs = now;
+        LogConsole(std::string("[HookDiag:") + sourceTag + "] Меню переключено командой /" + key);
         ToggleLoaderMenu();
-        LogConsole(std::string("[HookDiag:") + sourceTag + "] Меню переключено через /" + key);
         return true;
     }
 
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     auto it = g_ChatCommands.find(key);
-    if (it == g_ChatCommands.end()) return false;
+    if (it == g_ChatCommands.end()) {
+        return false; // Not a Lua command -> let game send it to SA-MP server
+    }
 
     g_LastInterceptedCmd = utf8;
     g_LastInterceptedMs = now;
-    LogConsole(std::string("[HookDiag:") + sourceTag + "] Перехвачено /" + key + " (" + cmdArgs + ")");
+    LogConsole(std::string("[HookDiag:") + sourceTag + "] Выполнена команда /" + key + (cmdArgs.empty() ? "" : (" " + cmdArgs)));
 
     RegisteredCommand reg = it->second;
     if (reg.L && reg.funcRef != LUA_NOREF) {
@@ -494,230 +396,391 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     return true;
 }
 
-static void hooked_OnInputEnd(JNIEnv* env, jobject thiz, jbyteArray array) {
-    if (env && *reinterpret_cast<void***>(env) && array) {
-        void** vtable = *reinterpret_cast<void***>(env);
-        typedef int (*Fn_GetArrayLength)(JNIEnv*, jbyteArray);
-        typedef int8_t* (*Fn_GetByteArrayElements)(JNIEnv*, jbyteArray, uint8_t*);
-        typedef void (*Fn_ReleaseByteArrayElements)(JNIEnv*, jbyteArray, int8_t*, int);
-
-        auto getLen = reinterpret_cast<Fn_GetArrayLength>(vtable[171]);
-        auto getBytes = reinterpret_cast<Fn_GetByteArrayElements>(vtable[184]);
-        auto relBytes = reinterpret_cast<Fn_ReleaseByteArrayElements>(vtable[192]);
-
-        if (getLen && getBytes && relBytes) {
-            int len = getLen(env, array);
-            if (len > 0 && len < 4096) {
-                int8_t* ptr = getBytes(env, array, nullptr);
-                if (ptr) {
-                    std::string text(reinterpret_cast<const char*>(ptr), len);
-                    relBytes(env, array, ptr, 2);
-                    if (TryExecuteChatCommand(text, "JNI-OnInputEnd")) {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    if (orig_OnInputEnd) orig_OnInputEnd(env, thiz, array);
-}
-
-static void hooked_SendCommand(void* thisPtr, const char* cmd) {
-    g_LastNetGamePtr = thisPtr;
-    if (cmd && TryExecuteChatCommand(cmd, "SendCommand")) return;
-    if (orig_SendCommand) orig_SendCommand(thisPtr, cmd);
-}
-
-static void hooked_SendChat(void* thisPtr, const char* msg) {
-    g_LastNetGamePtr = thisPtr;
-    if (msg && TryExecuteChatCommand(msg, "SendChat")) return;
-    if (orig_SendChat) orig_SendChat(thisPtr, msg);
-}
-
 // ============================================================================
-// 6. INCOMING CHAT & DIALOG HOOKS -> samp.events
+// 5. NATIVE UIKIT MENU & FLOATING BUTTON "42"
 // ============================================================================
 
-static void DispatchSampEvent(const char* eventName, uint32_t color, const std::string& text) {
-    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    for (auto* s : g_Scripts) {
-        if (!s->enabled || !s->L || s->hasError) continue;
-        lua_State* L = s->L;
-        lua_getglobal(L, "_DISPATCH_SAMP_EVENT");
-        if (lua_isfunction(L, -1)) {
-            lua_pushstring(L, eventName);
-            lua_pushinteger(L, color);
-            lua_pushstring(L, text.c_str());
-            if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
-                LogConsole("[Event " + std::string(eventName) + " ERROR] " + (lua_tostring(L, -1) ?: ""));
-                lua_pop(L, 1);
-            }
-        } else {
-            lua_pop(L, 1);
+@interface LoaderUIHandler : NSObject <UITextFieldDelegate>
++ (instancetype)shared;
+- (void)onFloatingBtnTap:(UIButton*)sender;
+- (void)onFloatingBtnPan:(UIPanGestureRecognizer*)pan;
+- (void)onCloseMenu:(UIButton*)sender;
+- (void)onTabChanged:(UISegmentedControl*)seg;
+- (void)onActionBtnTap:(UIButton*)sender;
+- (void)onScriptSwitchChanged:(UISwitch*)sw;
+- (void)onScriptReloadTap:(UIButton*)btn;
+- (void)onDisplayLink:(CADisplayLink*)link;
+- (void)onImGuiCloseTap:(UIButton*)btn;
+- (void)onImGuiButtonTap:(UIButton*)btn;
+@end
+
+static NSInteger g_ClickedImGuiButtonTag = -1;
+
+static void BuildNativeMenuIfNeeded() {
+    UIWindow* win = GetActiveKeyWindow();
+    if (!win) return;
+
+    if (!g_MenuOverlayView) {
+        CGFloat sw = win.bounds.size.width;
+        CGFloat sh = win.bounds.size.height;
+        CGFloat mw = MIN(sw - 28.0, 540.0);
+        CGFloat mh = MIN(sh - 44.0, 340.0);
+
+        UIView* card = [[UIView alloc] initWithFrame:CGRectMake((sw - mw) * 0.5, (sh - mh) * 0.5, mw, mh)];
+        card.tag = 424201;
+        card.backgroundColor = [UIColor colorWithRed:0.09 green:0.08 blue:0.13 alpha:0.96];
+        card.layer.cornerRadius = 16.0;
+        card.layer.borderWidth = 1.5;
+        card.layer.borderColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.88 alpha:0.90].CGColor;
+        card.hidden = YES;
+
+        // Header
+        UIView* header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, mw, 42.0)];
+        header.backgroundColor = [UIColor colorWithRed:0.24 green:0.14 blue:0.40 alpha:1.0];
+        header.layer.cornerRadius = 16.0;
+        header.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        [card addSubview:header];
+
+        UILabel* title = [[UILabel alloc] initWithFrame:CGRectMake(14.0, 0, mw - 180.0, 42.0)];
+        title.text = @"Arizona 42Loader  |  Lua 5.4";
+        title.textColor = [UIColor whiteColor];
+        title.font = [UIFont boldSystemFontOfSize:14.0];
+        [header addSubview:title];
+
+        g_MenuRamLabel = [[UILabel alloc] initWithFrame:CGRectMake(mw - 175.0, 0, 130.0, 42.0)];
+        g_MenuRamLabel.textColor = [UIColor colorWithWhite:0.85 alpha:0.9];
+        g_MenuRamLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0 weight:UIFontWeightMedium];
+        g_MenuRamLabel.textAlignment = NSTextAlignmentRight;
+        [header addSubview:g_MenuRamLabel];
+
+        UIButton* closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeBtn.frame = CGRectMake(mw - 40.0, 4.0, 34.0, 34.0);
+        [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+        [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+        [closeBtn addTarget:[LoaderUIHandler shared] action:@selector(onCloseMenu:) forControlEvents:UIControlEventTouchUpInside];
+        [header addSubview:closeBtn];
+
+        // Tabs
+        g_MenuTabs = [[UISegmentedControl alloc] initWithItems:@[@"Scripts", @"Commands", @"Console", @"Settings"]];
+        g_MenuTabs.frame = CGRectMake(12.0, 48.0, mw - 24.0, 30.0);
+        g_MenuTabs.selectedSegmentIndex = 0;
+        g_MenuTabs.backgroundColor = [UIColor colorWithRed:0.16 green:0.14 blue:0.22 alpha:1.0];
+        if (@available(iOS 13.0, *)) {
+            g_MenuTabs.selectedSegmentTintColor = [UIColor colorWithRed:0.48 green:0.26 blue:0.82 alpha:1.0];
         }
+        [g_MenuTabs setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]} forState:UIControlStateNormal];
+        [g_MenuTabs addTarget:[LoaderUIHandler shared] action:@selector(onTabChanged:) forControlEvents:UIControlEventValueChanged];
+        [card addSubview:g_MenuTabs];
+
+        // Action Bar (Reload All / Clear Console / Execute Command)
+        g_MenuCmdBar = [[UIView alloc] initWithFrame:CGRectMake(12.0, 84.0, mw - 24.0, 34.0)];
+        [card addSubview:g_MenuCmdBar];
+
+        g_MenuCmdField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, mw - 134.0, 34.0)];
+        g_MenuCmdField.backgroundColor = [UIColor colorWithRed:0.16 green:0.15 blue:0.22 alpha:1.0];
+        g_MenuCmdField.textColor = [UIColor whiteColor];
+        g_MenuCmdField.font = [UIFont systemFontOfSize:13.0];
+        g_MenuCmdField.layer.cornerRadius = 8.0;
+        g_MenuCmdField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 34)];
+        g_MenuCmdField.leftViewMode = UITextFieldViewModeAlways;
+        g_MenuCmdField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Введите команду (/st 12)..."
+                                                                              attributes:@{NSForegroundColorAttributeName: [UIColor lightGrayColor]}];
+        g_MenuCmdField.delegate = [LoaderUIHandler shared];
+        g_MenuCmdField.returnKeyType = UIReturnKeyDone;
+        [g_MenuCmdBar addSubview:g_MenuCmdField];
+
+        g_MenuActionBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        g_MenuActionBtn.frame = CGRectMake(0, 0, 150.0, 34.0);
+        g_MenuActionBtn.backgroundColor = [UIColor colorWithRed:0.45 green:0.24 blue:0.78 alpha:1.0];
+        g_MenuActionBtn.layer.cornerRadius = 8.0;
+        [g_MenuActionBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        g_MenuActionBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [g_MenuActionBtn addTarget:[LoaderUIHandler shared] action:@selector(onActionBtnTap:) forControlEvents:UIControlEventTouchUpInside];
+        [g_MenuCmdBar addSubview:g_MenuActionBtn];
+
+        // Scrollable Content
+        g_MenuScrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(12.0, 124.0, mw - 24.0, mh - 134.0)];
+        g_MenuScrollView.backgroundColor = [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.90];
+        g_MenuScrollView.layer.cornerRadius = 10.0;
+        [card addSubview:g_MenuScrollView];
+
+        g_MenuOverlayView = card;
     }
+
+    if (g_MenuOverlayView.superview != win) {
+        [win addSubview:g_MenuOverlayView];
+    }
+    [win bringSubviewToFront:g_MenuOverlayView];
 }
 
-static void hooked_AddChatMessage(void* thisPtr, uint32_t color, const char* text) {
-    if (text) {
-        std::string utf8 = Cp1251ToUtf8(text);
-        {
-            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-            g_ChatHistory.push_back({utf8, "", color, color});
-            if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
-        }
-        DispatchSampEvent("onServerMessage", color, utf8);
-    }
-    if (orig_AddChatMessage) orig_AddChatMessage(thisPtr, color, text);
-}
+static void RefreshMenuContent() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BuildNativeMenuIfNeeded();
+        if (!g_MenuOverlayView) return;
 
-static void hooked_ShowDialog(void* thisPtr, int id, int style, const char* title, const char* text, const char* btn1, const char* btn2, bool b) {
-    {
+        g_MenuOverlayView.hidden = !g_MenuOpen;
+        if (!g_MenuOpen) return;
+
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        g_CurrentDialogId = id;
-        g_CurrentDialogStyle = style;
-        g_IsDialogActive = true;
-        g_CurrentDialogTitle = title ? Cp1251ToUtf8(title) : "";
-        g_CurrentDialogText = text ? Cp1251ToUtf8(text) : "";
-    }
-    if (orig_ShowDialog) orig_ShowDialog(thisPtr, id, style, title, text, btn1, btn2, b);
-}
 
-// ============================================================================
-// 7. SAFE MACH-O REBINDING (__DATA ONLY) + UIKIT DELEGATE SWIZZLING
-// ============================================================================
-
-static void* hooked_dlsym(void* handle, const char* symbol) {
-    void* addr = dlsym(handle, symbol);
-    if (!symbol || !addr) return addr;
-
-    if (strcmp(symbol, "Java_com_arizona_game_GTASA_OnInputEnd") == 0) {
-        if (!orig_OnInputEnd) orig_OnInputEnd = (Fn_OnInputEnd)addr;
-        LogConsole("[HookDiag:dlsym] Перехвачен Java_com_arizona_game_GTASA_OnInputEnd");
-        return (void*)hooked_OnInputEnd;
-    }
-    if (strcmp(symbol, "_ZN4CNetGame11SendCommandEPKc") == 0) {
-        if (!orig_SendCommand) orig_SendCommand = (Fn_SendCommand)addr;
-        return (void*)hooked_SendCommand;
-    }
-    if (strcmp(symbol, "_ZN4CNetGame8SendChatEPKc") == 0) {
-        if (!orig_SendChat) orig_SendChat = (Fn_SendChat)addr;
-        return (void*)hooked_SendChat;
-    }
-    if (strcmp(symbol, "_ZN11CChatWindow14AddChatMessageEjPKc") == 0) {
-        if (!orig_AddChatMessage) orig_AddChatMessage = (Fn_AddChatMessage)addr;
-        return (void*)hooked_AddChatMessage;
-    }
-    if (strcmp(symbol, "_ZN7CDialog4ShowEiiPKcS1_S1_S1_b") == 0) {
-        if (!orig_ShowDialog) orig_ShowDialog = (Fn_ShowDialog)addr;
-        return (void*)hooked_ShowDialog;
-    }
-    return addr;
-}
-
-struct Rebinding {
-    const char* name;
-    void* replacement;
-    void** replaced;
-};
-
-static void RebindWritableDataInImage(const struct mach_header* header, intptr_t slide) {
-    if (!header || header->magic != MH_MAGIC_64) return;
-    const auto* header64 = reinterpret_cast<const struct mach_header_64*>(header);
-
-    Dl_info info;
-    if (!dladdr((const void*)header, &info) || !info.dli_fname) return;
-    if (strstr(info.dli_fname, "LuaLoader") != nullptr) return;
-
-    NSString* bundlePath = [[NSBundle mainBundle] bundlePath];
-    if (!bundlePath || strncmp(info.dli_fname, [bundlePath UTF8String], bundlePath.length) != 0) {
-        return; // Only touch app bundle binaries, never Apple system frameworks
-    }
-
-    std::vector<Rebinding> rebindings = {
-        {"dlsym", (void*)hooked_dlsym, (void**)&orig_dlsym},
-        {"Java_com_arizona_game_GTASA_OnInputEnd", (void*)hooked_OnInputEnd, (void**)&orig_OnInputEnd},
-        {"_ZN4CNetGame11SendCommandEPKc", (void*)hooked_SendCommand, (void**)&orig_SendCommand},
-        {"_ZN4CNetGame8SendChatEPKc", (void*)hooked_SendChat, (void**)&orig_SendChat},
-        {"_ZN11CChatWindow14AddChatMessageEjPKc", (void*)hooked_AddChatMessage, (void**)&orig_AddChatMessage},
-        {"_ZN7CDialog4ShowEiiPKcS1_S1_S1_b", (void*)hooked_ShowDialog, (void**)&orig_ShowDialog}
-    };
-
-    const struct segment_command_64* linkeditSeg = nullptr;
-    const struct symtab_command* symtabCmd = nullptr;
-    const struct dysymtab_command* dysymtabCmd = nullptr;
-
-    uintptr_t cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header64->ncmds; i++) {
-        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
-            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkeditSeg = seg;
-        } else if (cmd->cmd == LC_SYMTAB) {
-            symtabCmd = reinterpret_cast<const struct symtab_command*>(cmd);
-        } else if (cmd->cmd == LC_DYSYMTAB) {
-            dysymtabCmd = reinterpret_cast<const struct dysymtab_command*>(cmd);
+        float totalLuaKB = 0.0f;
+        for (auto* s : g_Scripts) {
+            if (s->L) totalLuaKB += static_cast<float>(lua_gc(s->L, LUA_GCCOUNT, 0));
         }
-        cur += cmd->cmdsize;
-    }
+        g_MenuRamLabel.text = [NSString stringWithFormat:@"%.1f MB | %.0f KB", GetLoaderRAM_MB(), totalLuaKB];
 
-    if (!linkeditSeg || !symtabCmd || !dysymtabCmd || dysymtabCmd->nindirectsyms == 0) return;
+        for (UIView* sub in g_MenuScrollView.subviews) {
+            [sub removeFromSuperview];
+        }
 
-    uintptr_t linkeditBase = static_cast<uintptr_t>(slide) + linkeditSeg->vmaddr - linkeditSeg->fileoff;
-    const auto* symtab = reinterpret_cast<const struct nlist_64*>(linkeditBase + symtabCmd->symoff);
-    const char* strtab = reinterpret_cast<const char*>(linkeditBase + symtabCmd->stroff);
-    const uint32_t* indirectSymtab = reinterpret_cast<const uint32_t*>(linkeditBase + dysymtabCmd->indirectsymoff);
+        CGFloat w = g_MenuScrollView.bounds.size.width;
+        CGFloat y = 8.0;
 
-    cur = reinterpret_cast<uintptr_t>(header64) + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header64->ncmds; i++) {
-        const auto* cmd = reinterpret_cast<const struct load_command*>(cur);
-        if (cmd->cmd == LC_SEGMENT_64) {
-            const auto* seg = reinterpret_cast<const struct segment_command_64*>(cmd);
-            // Strictly writable __DATA only (prevents EXC_BAD_ACCESS on __DATA_CONST)
-            if (strcmp(seg->segname, SEG_DATA) == 0) {
-                const auto* sects = reinterpret_cast<const struct section_64*>(cur + sizeof(struct segment_command_64));
-                for (uint32_t j = 0; j < seg->nsects; j++) {
-                    uint32_t type = sects[j].flags & SECTION_TYPE;
-                    if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+        if (g_SelectedTab == 0) {
+            // Scripts tab
+            g_MenuCmdBar.hidden = NO;
+            g_MenuCmdField.hidden = YES;
+            g_MenuActionBtn.hidden = NO;
+            g_MenuActionBtn.frame = CGRectMake(0, 0, 155.0, 34.0);
+            [g_MenuActionBtn setTitle:@"Reload All Scripts" forState:UIControlStateNormal];
 
-                    uint32_t indirectOffset = sects[j].reserved1;
-                    size_t count = sects[j].size / sizeof(void*);
-                    void** bindings = reinterpret_cast<void**>(static_cast<uintptr_t>(slide) + sects[j].addr);
+            UILabel* dirLbl = [[UILabel alloc] initWithFrame:CGRectMake(10.0, y, w - 20.0, 18.0)];
+            dirLbl.text = @"Папка: Documents/lua_loader/scripts";
+            dirLbl.textColor = [UIColor lightGrayColor];
+            dirLbl.font = [UIFont systemFontOfSize:11.0];
+            [g_MenuScrollView addSubview:dirLbl];
+            y += 24.0;
 
-                    for (size_t k = 0; k < count; k++) {
-                        uint32_t symIdx = indirectSymtab[indirectOffset + k];
-                        if (symIdx == INDIRECT_SYMBOL_ABS || symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
-                        uint32_t strOffset = symtab[symIdx].n_un.n_strx;
-                        if (strOffset == 0) continue;
-                        const char* symName = strtab + strOffset;
-                        if (symName[0] == '_') symName++;
+            if (g_Scripts.empty()) {
+                UILabel* emptyLbl = [[UILabel alloc] initWithFrame:CGRectMake(10.0, y, w - 20.0, 24.0)];
+                emptyLbl.text = @"Нет загруженных .lua скриптов";
+                emptyLbl.textColor = [UIColor grayColor];
+                emptyLbl.font = [UIFont systemFontOfSize:13.0];
+                [g_MenuScrollView addSubview:emptyLbl];
+                y += 30.0;
+            }
 
-                        for (const auto& reb : rebindings) {
-                            if (strcmp(symName, reb.name) == 0) {
-                                if (reb.replaced && *reb.replaced == nullptr && bindings[k] != reb.replacement) {
-                                    *reb.replaced = bindings[k];
-                                }
-                                bindings[k] = reb.replacement;
-                            }
-                        }
-                    }
+            for (size_t i = 0; i < g_Scripts.size(); i++) {
+                LuaScriptInstance* s = g_Scripts[i];
+
+                UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(10.0, y + 2.0, 51.0, 31.0)];
+                sw.on = s->enabled;
+                sw.tag = static_cast<NSInteger>(i);
+                sw.transform = CGAffineTransformMakeScale(0.82, 0.82);
+                [sw addTarget:[LoaderUIHandler shared] action:@selector(onScriptSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+                [g_MenuScrollView addSubview:sw];
+
+                UILabel* nameLbl = [[UILabel alloc] initWithFrame:CGRectMake(62.0, y, w - 195.0, 32.0)];
+                nameLbl.text = [NSString stringWithUTF8String:s->filename.c_str()];
+                nameLbl.textColor = [UIColor whiteColor];
+                nameLbl.font = [UIFont boldSystemFontOfSize:13.0];
+                [g_MenuScrollView addSubview:nameLbl];
+
+                UILabel* statusLbl = [[UILabel alloc] initWithFrame:CGRectMake(w - 130.0, y, 56.0, 32.0)];
+                if (s->hasError) {
+                    statusLbl.text = @"[ERROR]";
+                    statusLbl.textColor = [UIColor systemRedColor];
+                } else if (s->enabled) {
+                    statusLbl.text = @"[OK]";
+                    statusLbl.textColor = [UIColor systemGreenColor];
+                } else {
+                    statusLbl.text = @"[OFF]";
+                    statusLbl.textColor = [UIColor grayColor];
+                }
+                statusLbl.font = [UIFont boldSystemFontOfSize:11.0];
+                [g_MenuScrollView addSubview:statusLbl];
+
+                UIButton* relBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+                relBtn.frame = CGRectMake(w - 72.0, y + 2.0, 62.0, 28.0);
+                relBtn.backgroundColor = [UIColor colorWithRed:0.22 green:0.20 blue:0.30 alpha:1.0];
+                relBtn.layer.cornerRadius = 6.0;
+                relBtn.tag = static_cast<NSInteger>(i);
+                [relBtn setTitle:@"Reload" forState:UIControlStateNormal];
+                [relBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                relBtn.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
+                [relBtn addTarget:[LoaderUIHandler shared] action:@selector(onScriptReloadTap:) forControlEvents:UIControlEventTouchUpInside];
+                [g_MenuScrollView addSubview:relBtn];
+
+                y += 36.0;
+
+                if (s->hasError && !s->lastError.empty()) {
+                    NSString* errStr = [NSString stringWithUTF8String:ShortenPathForUI(s->lastError).c_str()];
+                    UILabel* errLbl = [[UILabel alloc] initWithFrame:CGRectMake(16.0, y, w - 32.0, 44.0)];
+                    errLbl.text = errStr;
+                    errLbl.textColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.45 alpha:1.0];
+                    errLbl.font = [UIFont systemFontOfSize:11.0];
+                    errLbl.numberOfLines = 0;
+                    [errLbl sizeToFit];
+                    [g_MenuScrollView addSubview:errLbl];
+                    y += errLbl.bounds.size.height + 8.0;
                 }
             }
+
+        } else if (g_SelectedTab == 1) {
+            // Commands tab
+            g_MenuCmdBar.hidden = NO;
+            g_MenuCmdField.hidden = NO;
+            g_MenuActionBtn.hidden = NO;
+            g_MenuCmdField.frame = CGRectMake(0, 0, w - 102.0, 34.0);
+            g_MenuActionBtn.frame = CGRectMake(w - 94.0, 0, 94.0, 34.0);
+            [g_MenuActionBtn setTitle:@"Выполнить" forState:UIControlStateNormal];
+
+            UILabel* infoLbl = [[UILabel alloc] initWithFrame:CGRectMake(10.0, y, w - 20.0, 34.0)];
+            infoLbl.text = @"Меню: /42, /42loader, /luasettings\nКоманды скриптов (работают в чате без учёта регистра):";
+            infoLbl.textColor = [UIColor lightGrayColor];
+            infoLbl.font = [UIFont systemFontOfSize:11.5];
+            infoLbl.numberOfLines = 0;
+            [g_MenuScrollView addSubview:infoLbl];
+            y += 38.0;
+
+            for (const auto& kv : g_ChatCommands) {
+                UILabel* cmdLbl = [[UILabel alloc] initWithFrame:CGRectMake(12.0, y, w - 24.0, 22.0)];
+                cmdLbl.text = [NSString stringWithFormat:@"• /%s  (%s)", kv.first.c_str(), kv.second.scriptName.c_str()];
+                cmdLbl.textColor = [UIColor whiteColor];
+                cmdLbl.font = [UIFont monospacedSystemFontOfSize:12.5 weight:UIFontWeightMedium];
+                [g_MenuScrollView addSubview:cmdLbl];
+                y += 24.0;
+            }
+
+        } else if (g_SelectedTab == 2) {
+            // Console tab
+            g_MenuCmdBar.hidden = NO;
+            g_MenuCmdField.hidden = YES;
+            g_MenuActionBtn.hidden = NO;
+            g_MenuActionBtn.frame = CGRectMake(0, 0, 130.0, 34.0);
+            [g_MenuActionBtn setTitle:@"Clear Console" forState:UIControlStateNormal];
+
+            for (const auto& line : g_ConsoleLogs) {
+                NSString* nsLine = [NSString stringWithUTF8String:line.c_str()] ?: @"";
+                UILabel* logLbl = [[UILabel alloc] initWithFrame:CGRectMake(10.0, y, w - 20.0, 20.0)];
+                logLbl.text = nsLine;
+                logLbl.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
+                logLbl.numberOfLines = 0;
+                if (line.find("ERROR") != std::string::npos) {
+                    logLbl.textColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
+                } else if (line.find("HookDiag") != std::string::npos || line.find("[OK]") != std::string::npos) {
+                    logLbl.textColor = [UIColor colorWithRed:0.45 green:0.95 blue:0.60 alpha:1.0];
+                } else {
+                    logLbl.textColor = [UIColor colorWithWhite:0.90 alpha:1.0];
+                }
+                [logLbl sizeToFit];
+                [g_MenuScrollView addSubview:logLbl];
+                y += logLbl.bounds.size.height + 4.0;
+            }
+
+        } else if (g_SelectedTab == 3) {
+            // Settings tab
+            g_MenuCmdBar.hidden = YES;
+
+            UILabel* setLbl = [[UILabel alloc] initWithFrame:CGRectMake(12.0, y, w - 24.0, 120.0)];
+            setLbl.text = [NSString stringWithFormat:
+                @"Время мира: %02d:%02d\nПогода ID: %d\nЗагружено скриптов: %zu\nЗарегистрировано команд: %zu\nДиректория: Documents/lua_loader",
+                g_WorldHour, g_WorldMinute, g_WorldWeather, g_Scripts.size(), g_ChatCommands.size()];
+            setLbl.textColor = [UIColor whiteColor];
+            setLbl.font = [UIFont systemFontOfSize:13.0];
+            setLbl.numberOfLines = 0;
+            [setLbl sizeToFit];
+            [g_MenuScrollView addSubview:setLbl];
+            y += setLbl.bounds.size.height + 12.0;
         }
-        cur += cmd->cmdsize;
-    }
+
+        g_MenuScrollView.contentSize = CGSizeMake(w, MAX(y + 10.0, g_MenuScrollView.bounds.size.height));
+        if (g_SelectedTab == 2 && g_MenuScrollView.contentSize.height > g_MenuScrollView.bounds.size.height) {
+            CGPoint bottomOffset = CGPointMake(0, g_MenuScrollView.contentSize.height - g_MenuScrollView.bounds.size.height);
+            [g_MenuScrollView setContentOffset:bottomOffset animated:NO];
+        }
+    });
 }
 
-typedef BOOL (*Fn_TextFieldShouldReturn)(id, SEL, UITextField*);
-typedef BOOL (*Fn_ShouldChangeChars)(id, SEL, UITextField*, NSRange, NSString*);
+static void ToggleLoaderMenu() {
+    g_MenuOpen = !g_MenuOpen;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_FloatingMenuButton) {
+            g_FloatingMenuButton.backgroundColor = g_MenuOpen
+                ? [UIColor colorWithRed:0.52 green:0.26 blue:0.88 alpha:0.95]
+                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+        }
+        RefreshMenuContent();
+    });
+}
 
-static std::unordered_map<Class, Fn_TextFieldShouldReturn> g_OrigShouldReturnMap;
-static std::unordered_map<Class, Fn_ShouldChangeChars> g_OrigShouldChangeMap;
+static void EnsureFloatingMenuButton() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = GetActiveKeyWindow();
+        if (!win) return;
+
+        if (g_FloatingMenuButton) {
+            if (g_FloatingMenuButton.superview != win) [win addSubview:g_FloatingMenuButton];
+            [win bringSubviewToFront:g_FloatingMenuButton];
+            if (g_MenuOverlayView && !g_MenuOverlayView.hidden) {
+                [win bringSubviewToFront:g_MenuOverlayView];
+            }
+            return;
+        }
+
+        UIButton* btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.tag = 424200;
+        btn.frame = CGRectMake(18.0, 52.0, 48.0, 48.0);
+        btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+        btn.layer.cornerRadius = 24.0;
+        btn.layer.borderWidth = 1.5;
+        btn.layer.borderColor = [UIColor colorWithRed:0.62 green:0.38 blue:0.95 alpha:0.95].CGColor;
+        [btn setTitle:@"42" forState:UIControlStateNormal];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+
+        [btn addTarget:[LoaderUIHandler shared] action:@selector(onFloatingBtnTap:) forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:[LoaderUIHandler shared] action:@selector(onFloatingBtnPan:)];
+        [btn addGestureRecognizer:pan];
+
+        [win addSubview:btn];
+        [win bringSubviewToFront:btn];
+        g_FloatingMenuButton = btn;
+    });
+}
+
+// ============================================================================
+// 6. MULTI-LAYER UIKIT CHAT INPUT INTERCEPTION (ZERO CRASHES)
+// ============================================================================
+
+typedef void (*Fn_SetDelegate)(id, SEL, id);
+typedef BOOL (*Fn_TextFieldShouldReturn)(id, SEL, UITextField*);
+typedef BOOL (*Fn_TFShouldChangeChars)(id, SEL, UITextField*, NSRange, NSString*);
+typedef BOOL (*Fn_TVShouldChangeText)(id, SEL, UITextView*, NSRange, NSString*);
+typedef BOOL (*Fn_SendAction)(id, SEL, SEL, id, id, UIEvent*);
+typedef void (*Fn_InsertText)(id, SEL, NSString*);
+typedef BOOL (*Fn_BecomeFirstResponder)(id, SEL);
+
+static Fn_SetDelegate orig_TFSetDelegate = nullptr;
+static Fn_SetDelegate orig_TVSetDelegate = nullptr;
+static Fn_SendAction orig_SendAction = nullptr;
+static Fn_BecomeFirstResponder orig_BecomeFirstResponder = nullptr;
+
+static std::unordered_map<Class, IMP> g_OrigShouldReturnMap;
+static std::unordered_map<Class, IMP> g_OrigTFShouldChangeMap;
+static std::unordered_map<Class, IMP> g_OrigTVShouldChangeMap;
+static std::unordered_map<Class, IMP> g_OrigInsertTextMap;
+
+static void HookMethodOnClass(Class cls, SEL sel, IMP replacement, std::unordered_map<Class, IMP>& origMap) {
+    if (!cls || origMap.find(cls) != origMap.end()) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    IMP currentImp = method_getImplementation(m);
+    if (currentImp == replacement) return;
+
+    const char* types = method_getTypeEncoding(m);
+    if (class_addMethod(cls, sel, replacement, types)) {
+        origMap[cls] = currentImp;
+    } else {
+        origMap[cls] = method_setImplementation(m, replacement);
+    }
+}
 
 static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField* textField) {
     if (textField && textField.text.length > 0) {
         std::string txt([textField.text UTF8String]);
-        if (TryExecuteChatCommand(txt, "UIKit-ShouldReturn")) {
+        if (TryExecuteChatCommand(txt, "TF-ShouldReturn")) {
             textField.text = @"";
             [textField resignFirstResponder];
             return NO;
@@ -726,17 +789,16 @@ static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField* textF
     Class cls = object_getClass(self);
     auto it = g_OrigShouldReturnMap.find(cls);
     if (it != g_OrigShouldReturnMap.end() && it->second) {
-        return it->second(self, _cmd, textField);
+        return ((Fn_TextFieldShouldReturn)it->second)(self, _cmd, textField);
     }
     return YES;
 }
 
-static BOOL swizzled_shouldChangeCharacters(id self, SEL _cmd, UITextField* textField, NSRange range, NSString* string) {
-    // iOS GTA/Arizona keyboard wrapper catches Return via replacementString == "\n"
+static BOOL swizzled_tfShouldChangeChars(id self, SEL _cmd, UITextField* textField, NSRange range, NSString* string) {
     if (string && ([string rangeOfString:@"\n"].location != NSNotFound || [string rangeOfString:@"\r"].location != NSNotFound)) {
         if (textField && textField.text.length > 0) {
             std::string txt([textField.text UTF8String]);
-            if (TryExecuteChatCommand(txt, "UIKit-ShouldChangeNewline")) {
+            if (TryExecuteChatCommand(txt, "TF-Newline")) {
                 textField.text = @"";
                 [textField resignFirstResponder];
                 return NO;
@@ -744,62 +806,224 @@ static BOOL swizzled_shouldChangeCharacters(id self, SEL _cmd, UITextField* text
         }
     }
     Class cls = object_getClass(self);
-    auto it = g_OrigShouldChangeMap.find(cls);
-    if (it != g_OrigShouldChangeMap.end() && it->second) {
-        return it->second(self, _cmd, textField, range, string);
+    auto it = g_OrigTFShouldChangeMap.find(cls);
+    if (it != g_OrigTFShouldChangeMap.end() && it->second) {
+        return ((Fn_TFShouldChangeChars)it->second)(self, _cmd, textField, range, string);
     }
     return YES;
 }
 
-static void InstallUIKitTextFieldHooks() {
-    NSString* mainBundlePath = [[NSBundle mainBundle] bundlePath];
-    unsigned int numClasses = 0;
-    Class* classes = objc_copyClassList(&numClasses);
-    if (!classes) return;
-
-    for (unsigned int i = 0; i < numClasses; i++) {
-        Class cls = classes[i];
-        const char* img = class_getImageName(cls);
-        if (!img || strncmp(img, [mainBundlePath UTF8String], mainBundlePath.length) != 0) {
-            continue;
-        }
-
-        Method mRet = class_getInstanceMethod(cls, @selector(textFieldShouldReturn:));
-        if (mRet && method_getImplementation(mRet) != (IMP)swizzled_textFieldShouldReturn) {
-            g_OrigShouldReturnMap[cls] = (Fn_TextFieldShouldReturn)method_getImplementation(mRet);
-            method_setImplementation(mRet, (IMP)swizzled_textFieldShouldReturn);
-        }
-
-        Method mChg = class_getInstanceMethod(cls, @selector(textField:shouldChangeCharactersInRange:replacementString:));
-        if (mChg && method_getImplementation(mChg) != (IMP)swizzled_shouldChangeCharacters) {
-            g_OrigShouldChangeMap[cls] = (Fn_ShouldChangeChars)method_getImplementation(mChg);
-            method_setImplementation(mChg, (IMP)swizzled_shouldChangeCharacters);
+static BOOL swizzled_tvShouldChangeText(id self, SEL _cmd, UITextView* textView, NSRange range, NSString* text) {
+    if (text && ([text rangeOfString:@"\n"].location != NSNotFound || [text rangeOfString:@"\r"].location != NSNotFound)) {
+        if (textView && textView.text.length > 0) {
+            std::string txt([textView.text UTF8String]);
+            if (TryExecuteChatCommand(txt, "TV-Newline")) {
+                textView.text = @"";
+                [textView resignFirstResponder];
+                return NO;
+            }
         }
     }
-    free(classes);
+    Class cls = object_getClass(self);
+    auto it = g_OrigTVShouldChangeMap.find(cls);
+    if (it != g_OrigTVShouldChangeMap.end() && it->second) {
+        return ((Fn_TVShouldChangeText)it->second)(self, _cmd, textView, range, text);
+    }
+    return YES;
+}
+
+static void HookDelegateObject(id delegate) {
+    if (!delegate || delegate == [LoaderUIHandler shared]) return;
+    Class cls = object_getClass(delegate);
+    if (!cls) return;
+    const char* name = class_getName(cls);
+    // Never touch Apple's private UIKit internal delegates
+    if (!name || strncmp(name, "_UI", 3) == 0 || strncmp(name, "UI", 2) == 0) return;
+
+    HookMethodOnClass(cls, @selector(textFieldShouldReturn:), (IMP)swizzled_textFieldShouldReturn, g_OrigShouldReturnMap);
+    HookMethodOnClass(cls, @selector(textField:shouldChangeCharactersInRange:replacementString:), (IMP)swizzled_tfShouldChangeChars, g_OrigTFShouldChangeMap);
+    HookMethodOnClass(cls, @selector(textView:shouldChangeTextInRange:replacementText:), (IMP)swizzled_tvShouldChangeText, g_OrigTVShouldChangeMap);
+}
+
+static void swizzled_TFSetDelegate(id self, SEL _cmd, id delegate) {
+    HookDelegateObject(delegate);
+    if (orig_TFSetDelegate) orig_TFSetDelegate(self, _cmd, delegate);
+}
+
+static void swizzled_TVSetDelegate(id self, SEL _cmd, id delegate) {
+    HookDelegateObject(delegate);
+    if (orig_TVSetDelegate) orig_TVSetDelegate(self, _cmd, delegate);
+}
+
+static void swizzled_insertText(id self, SEL _cmd, NSString* text) {
+    if (text && ([text rangeOfString:@"\n"].location != NSNotFound || [text rangeOfString:@"\r"].location != NSNotFound)) {
+        NSString* current = nil;
+        if ([self respondsToSelector:@selector(text)]) {
+            current = [(id)self performSelector:@selector(text)];
+        }
+        if ([current isKindOfClass:[NSString class]] && current.length > 0) {
+            std::string txt([current UTF8String]);
+            if (TryExecuteChatCommand(txt, "KeyInput-InsertNewline")) {
+                if ([self respondsToSelector:@selector(setText:)]) {
+                    [(id)self performSelector:@selector(setText:) withObject:@""];
+                }
+                if ([self respondsToSelector:@selector(resignFirstResponder)]) {
+                    [(id)self resignFirstResponder];
+                }
+                return;
+            }
+        }
+    }
+    Class cls = object_getClass(self);
+    auto it = g_OrigInsertTextMap.find(cls);
+    if (it != g_OrigInsertTextMap.end() && it->second) {
+        ((Fn_InsertText)it->second)(self, _cmd, text);
+    }
+}
+
+static BOOL swizzled_becomeFirstResponder(id self, SEL _cmd) {
+    BOOL res = orig_BecomeFirstResponder ? orig_BecomeFirstResponder(self, _cmd) : YES;
+    if (res && [self conformsToProtocol:@protocol(UIKeyInput)]) {
+        g_ActiveInputView = (UIView*)self;
+        if ([self respondsToSelector:@selector(delegate)]) {
+            HookDelegateObject([(id)self performSelector:@selector(delegate)]);
+        }
+        Class cls = object_getClass(self);
+        const char* name = cls ? class_getName(cls) : nullptr;
+        if (name && strncmp(name, "_UI", 3) != 0 && strncmp(name, "UI", 2) != 0) {
+            HookMethodOnClass(cls, @selector(insertText:), (IMP)swizzled_insertText, g_OrigInsertTextMap);
+        }
+    }
+    return res;
+}
+
+static BOOL swizzled_sendAction(id self, SEL _cmd, SEL action, id target, id sender, UIEvent* event) {
+    // 1. Direct UITextField action (e.g. EditingDidEndOnExit)
+    if ([sender isKindOfClass:[UITextField class]]) {
+        UITextField* tf = (UITextField*)sender;
+        if (tf != g_MenuCmdField && tf.text.length > 0) {
+            std::string txt([tf.text UTF8String]);
+            if (TryExecuteChatCommand(txt, "UIControl-SendAction")) {
+                tf.text = @"";
+                [tf resignFirstResponder];
+                return NO;
+            }
+        }
+    }
+    // 2. Custom on-screen "Send / Отправить" UIButton tapped while a text input is active
+    if ([sender isKindOfClass:[UIControl class]] && sender != g_MenuActionBtn && sender != g_FloatingMenuButton) {
+        UIView* active = g_ActiveInputView;
+        if (active && active != g_MenuCmdField && [active respondsToSelector:@selector(text)]) {
+            NSString* cur = [(id)active performSelector:@selector(text)];
+            if ([cur isKindOfClass:[NSString class]] && cur.length > 0) {
+                std::string txt([cur UTF8String]);
+                if (TryExecuteChatCommand(txt, "SendBtn-SendAction")) {
+                    if ([active respondsToSelector:@selector(setText:)]) {
+                        [(id)active performSelector:@selector(setText:) withObject:@""];
+                    }
+                    [active resignFirstResponder];
+                    return NO;
+                }
+            }
+        }
+    }
+    return orig_SendAction ? orig_SendAction(self, _cmd, action, target, sender, event) : NO;
+}
+
+static void ScanExistingViews(UIView* root) {
+    if (!root) return;
+    if ([root isKindOfClass:[UITextField class]]) {
+        UITextField* tf = (UITextField*)root;
+        if (tf != g_MenuCmdField) {
+            HookDelegateObject(tf.delegate);
+            if (tf.isFirstResponder) g_ActiveInputView = tf;
+        }
+    } else if ([root isKindOfClass:[UITextView class]]) {
+        UITextView* tv = (UITextView*)root;
+        HookDelegateObject(tv.delegate);
+        if (tv.isFirstResponder) g_ActiveInputView = tv;
+    }
+    for (UIView* sub in root.subviews) {
+        ScanExistingViews(sub);
+    }
+}
+
+static void InstallSafeUIKitChatHooks() {
+    Method mTFDel = class_getInstanceMethod([UITextField class], @selector(setDelegate:));
+    if (mTFDel && method_getImplementation(mTFDel) != (IMP)swizzled_TFSetDelegate) {
+        orig_TFSetDelegate = (Fn_SetDelegate)method_setImplementation(mTFDel, (IMP)swizzled_TFSetDelegate);
+    }
+
+    Method mTVDel = class_getInstanceMethod([UITextView class], @selector(setDelegate:));
+    if (mTVDel && method_getImplementation(mTVDel) != (IMP)swizzled_TVSetDelegate) {
+        orig_TVSetDelegate = (Fn_SetDelegate)method_setImplementation(mTVDel, (IMP)swizzled_TVSetDelegate);
+    }
+
+    Method mAct = class_getInstanceMethod([UIApplication class], @selector(sendAction:to:from:forEvent:));
+    if (mAct && method_getImplementation(mAct) != (IMP)swizzled_sendAction) {
+        orig_SendAction = (Fn_SendAction)method_setImplementation(mAct, (IMP)swizzled_sendAction);
+    }
+
+    Method mBfr = class_getInstanceMethod([UIView class], @selector(becomeFirstResponder));
+    if (mBfr && method_getImplementation(mBfr) != (IMP)swizzled_becomeFirstResponder) {
+        orig_BecomeFirstResponder = (Fn_BecomeFirstResponder)method_setImplementation(mBfr, (IMP)swizzled_becomeFirstResponder);
+    }
+
+    UIWindow* win = GetActiveKeyWindow();
+    if (win) ScanExistingViews(win);
 
     NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+
+    [nc addObserverForName:UITextFieldTextDidBeginEditingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
+        UITextField* tf = note.object;
+        if ([tf isKindOfClass:[UITextField class]] && tf != g_MenuCmdField) {
+            g_ActiveInputView = tf;
+            g_IsChatInputActive = true;
+            HookDelegateObject(tf.delegate);
+        }
+    }];
+
     [nc addObserverForName:UITextFieldTextDidChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
         UITextField* tf = note.object;
-        if ([tf isKindOfClass:[UITextField class]]) {
+        if ([tf isKindOfClass:[UITextField class]] && tf != g_MenuCmdField) {
+            g_ActiveInputView = tf;
             g_ChatInputText = tf.text ? [tf.text UTF8String] : "";
             g_IsChatInputActive = true;
         }
     }];
+
     [nc addObserverForName:UITextFieldTextDidEndEditingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
         g_IsChatInputActive = false;
         UITextField* tf = note.object;
-        if ([tf isKindOfClass:[UITextField class]] && tf.text.length > 0) {
+        if ([tf isKindOfClass:[UITextField class]] && tf != g_MenuCmdField && tf.text.length > 0) {
             std::string txt([tf.text UTF8String]);
-            if (TryExecuteChatCommand(txt, "UIKit-DidEndEditing")) {
+            if (TryExecuteChatCommand(txt, "TF-DidEndEditing")) {
                 tf.text = @"";
             }
+        }
+    }];
+
+    [nc addObserverForName:UITextViewTextDidBeginEditingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
+        UITextView* tv = note.object;
+        if ([tv isKindOfClass:[UITextView class]]) {
+            g_ActiveInputView = tv;
+            g_IsChatInputActive = true;
+            HookDelegateObject(tv.delegate);
+        }
+    }];
+
+    [nc addObserverForName:UITextViewTextDidChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* note) {
+        UITextView* tv = note.object;
+        if ([tv isKindOfClass:[UITextView class]]) {
+            g_ActiveInputView = tv;
+            g_ChatInputText = tv.text ? [tv.text UTF8String] : "";
+            g_IsChatInputActive = true;
         }
     }];
 }
 
 // ============================================================================
-// 8. LUA 5.4 C++ API FUNCTIONS (MOONLOADER + AZ + SAMP)
+// 7. LUA 5.4 C++ API FUNCTIONS (MOONLOADER + AZ + SAMP)
 // ============================================================================
 
 static int l_print(lua_State* L) {
@@ -836,12 +1060,7 @@ static int l_lua_thread_create(lua_State* L) {
     lua_pushvalue(L, 1);
     lua_xmove(L, co, 1);
 
-    LuaCoroutine lc;
-    lc.co = co;
-    lc.ref = ref;
-    lc.wakeTimeMs = NowMs();
-    lc.suspended = suspended;
-    inst->threads.push_back(lc);
+    inst->threads.push_back({co, ref, NowMs(), suspended, false});
 
     lua_newtable(L);
     lua_pushinteger(L, ref);
@@ -911,33 +1130,30 @@ static int l_sampIsChatCommandDefined(lua_State* L) {
 
 static int l_sampAddChatMessage(lua_State* L) {
     const char* text = luaL_checkstring(L, 1);
-    uint32_t color = static_cast<uint32_t>(luaL_optinteger(L, 2, 0xFFFFFFFF));
+    uint32_t color = static_cast<uint32_t>(luaL_optinteger(L, 2, 0xFF9B59B6));
     std::string utf8 = Cp1251ToUtf8(text);
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         g_ChatHistory.push_back({utf8, "", color, color});
         if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
-        g_Notifications.push_back({"42Loader", utf8, NowMs() + 4500});
     }
 
-    if (orig_AddChatMessage) {
-        std::string cp = Utf8ToCp1251(utf8);
-        orig_AddChatMessage(nullptr, color, cp.c_str());
-    }
     LogConsole("[Chat] " + utf8);
+    ShowBannerOnWindow(@"42Loader Chat", [NSString stringWithUTF8String:utf8.c_str()], color, 3.2, 424243);
     return 0;
 }
 
 static int l_sampSendChat(lua_State* L) {
-    SendRawToGameChat(Cp1251ToUtf8(luaL_checkstring(L, 1)));
+    std::string utf8 = Cp1251ToUtf8(luaL_checkstring(L, 1));
+    LogConsole("[ChatOut] " + utf8);
     return 0;
 }
 
 static int l_sampProcessChatInput(lua_State* L) {
     std::string utf8 = Cp1251ToUtf8(luaL_checkstring(L, 1));
     if (!TryExecuteChatCommand(utf8, "sampProcessChatInput")) {
-        SendRawToGameChat(utf8);
+        LogConsole("[ChatOut] " + utf8);
     }
     return 0;
 }
@@ -959,29 +1175,23 @@ static int l_sampShowDialog(lua_State* L) {
         g_CurrentDialogText = uText;
     }
 
-    if (orig_ShowDialog) {
-        orig_ShowDialog(nullptr, id, style,
-                        Utf8ToCp1251(uTitle).c_str(),
-                        Utf8ToCp1251(uText).c_str(),
-                        Utf8ToCp1251(uBtn1).c_str(),
-                        Utf8ToCp1251(uBtn2).c_str(), false);
-    } else {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
-                                                                           message:[NSString stringWithUTF8String:uText.c_str()]
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
-                                                      style:UIAlertActionStyleDefault
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:[NSString stringWithUTF8String:uTitle.c_str()]
+                                                                       message:[NSString stringWithUTF8String:uText.c_str()]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn1.c_str()]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
+        if (!uBtn2.empty()) {
+            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
+                                                      style:UIAlertActionStyleCancel
                                                     handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
-            if (!uBtn2.empty()) {
-                [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:uBtn2.c_str()]
-                                                          style:UIAlertActionStyleCancel
-                                                        handler:^(UIAlertAction* _Nonnull) { g_IsDialogActive = false; }]];
-            }
-            UIWindow* win = GetActiveKeyWindow();
-            [win.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-    }
+        }
+        UIWindow* win = GetActiveKeyWindow();
+        UIViewController* topVC = win.rootViewController;
+        while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+        [topVC presentViewController:alert animated:YES completion:nil];
+    });
     return 0;
 }
 
@@ -1073,30 +1283,22 @@ static int l_az_getClipboard(lua_State* L) {
     return 1;
 }
 static int l_az_notify(lua_State* L) {
-    const char* title = luaL_checkstring(L, 1);
-    const char* msg = luaL_checkstring(L, 2);
+    std::string title = Cp1251ToUtf8(luaL_checkstring(L, 1));
+    std::string msg = Cp1251ToUtf8(luaL_checkstring(L, 2));
     double sec = luaL_optnumber(L, 3, 3.0);
-    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    g_Notifications.push_back({Cp1251ToUtf8(title), Cp1251ToUtf8(msg), NowMs() + static_cast<uint64_t>(sec * 1000.0)});
+    ShowBannerOnWindow([NSString stringWithUTF8String:title.c_str()],
+                       [NSString stringWithUTF8String:msg.c_str()],
+                       0xFF9B59B6, sec, 424244);
     return 0;
 }
 static int l_az_banner(lua_State* L) {
-    ShowLauncherBanner([NSString stringWithUTF8String:Cp1251ToUtf8(luaL_checkstring(L, 1)).c_str()], NO);
+    ShowBannerOnWindow(@"", [NSString stringWithUTF8String:Cp1251ToUtf8(luaL_checkstring(L, 1)).c_str()], 0xFF9B59B6, 3.5, 424242);
     return 0;
 }
 static int l_az_openURL(lua_State* L) {
     NSURL* nsurl = [NSURL URLWithString:[NSString stringWithUTF8String:luaL_checkstring(L, 1)]];
     if (nsurl) dispatch_async(dispatch_get_main_queue(), ^{ [[UIApplication sharedApplication] openURL:nsurl options:@{} completionHandler:nil]; });
     return 0;
-}
-
-static float GetLoaderRAM_MB() {
-    task_vm_info_data_t vmInfo;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count) == KERN_SUCCESS) {
-        return static_cast<float>(vmInfo.phys_footprint) / (1024.0f * 1024.0f);
-    }
-    return 0.0f;
 }
 static int l_az_getLoaderRAM(lua_State* L) { lua_pushnumber(L, GetLoaderRAM_MB()); return 1; }
 
@@ -1138,8 +1340,117 @@ static int l_asyncHttpRequest(lua_State* L) {
     return 0;
 }
 
+// Native UIKit bridge for script imgui.* calls
+static int g_CurrentFrameButtonTag = 0;
+
+static int l_imgui_Begin(lua_State* L) {
+    const char* name = luaL_checkstring(L, 1);
+    bool hasClose = lua_isboolean(L, 2);
+    g_ScriptImGuiVisibleThisFrame = true;
+    g_ScriptImGuiBuilding = true;
+    g_CurrentFrameButtonTag = 1000;
+
+    UIWindow* win = GetActiveKeyWindow();
+    if (win) {
+        if (!g_ScriptImGuiWindow) {
+            CGFloat sw = win.bounds.size.width;
+            CGFloat sh = win.bounds.size.height;
+            UIView* box = [[UIView alloc] initWithFrame:CGRectMake((sw - 270.0) * 0.5, (sh - 170.0) * 0.5, 270.0, 170.0)];
+            box.backgroundColor = [UIColor colorWithRed:0.11 green:0.10 blue:0.16 alpha:0.95];
+            box.layer.cornerRadius = 12.0;
+            box.layer.borderWidth = 1.5;
+            box.layer.borderColor = [UIColor colorWithRed:0.60 green:0.36 blue:0.92 alpha:0.95].CGColor;
+
+            g_ScriptImGuiTitle = [[UILabel alloc] initWithFrame:CGRectMake(12.0, 6.0, 215.0, 24.0)];
+            g_ScriptImGuiTitle.textColor = [UIColor whiteColor];
+            g_ScriptImGuiTitle.font = [UIFont boldSystemFontOfSize:13.0];
+            [box addSubview:g_ScriptImGuiTitle];
+
+            UIButton* xBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            xBtn.frame = CGRectMake(234.0, 4.0, 28.0, 28.0);
+            [xBtn setTitle:@"✕" forState:UIControlStateNormal];
+            [xBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            [xBtn addTarget:[LoaderUIHandler shared] action:@selector(onImGuiCloseTap:) forControlEvents:UIControlEventTouchUpInside];
+            [box addSubview:xBtn];
+
+            g_ScriptImGuiStack = [[UIStackView alloc] initWithFrame:CGRectMake(12.0, 36.0, 246.0, 122.0)];
+            g_ScriptImGuiStack.axis = UILayoutConstraintAxisVertical;
+            g_ScriptImGuiStack.spacing = 8.0;
+            g_ScriptImGuiStack.distribution = UIStackViewDistributionFillEqually;
+            [box addSubview:g_ScriptImGuiStack];
+
+            g_ScriptImGuiWindow = box;
+        }
+        g_ScriptImGuiTitle.text = [NSString stringWithUTF8String:name];
+        for (UIView* v in g_ScriptImGuiStack.arrangedSubviews) {
+            [g_ScriptImGuiStack removeArrangedSubview:v];
+            [v removeFromSuperview];
+        }
+        if (g_ScriptImGuiWindow.superview != win) [win addSubview:g_ScriptImGuiWindow];
+        g_ScriptImGuiWindow.hidden = NO;
+    }
+
+    lua_pushboolean(L, 1);
+    if (hasClose) { lua_pushboolean(L, 1); return 2; }
+    return 1;
+}
+
+static int l_imgui_End(lua_State* L) {
+    g_ScriptImGuiBuilding = false;
+    return 0;
+}
+
+static int l_imgui_Text(lua_State* L) {
+    const char* txt = luaL_checkstring(L, 1);
+    if (g_ScriptImGuiBuilding && g_ScriptImGuiStack) {
+        UILabel* lbl = [[UILabel alloc] init];
+        lbl.text = [NSString stringWithUTF8String:Cp1251ToUtf8(txt).c_str()];
+        lbl.textColor = [UIColor whiteColor];
+        lbl.font = [UIFont systemFontOfSize:12.5];
+        lbl.numberOfLines = 0;
+        [g_ScriptImGuiStack addArrangedSubview:lbl];
+    }
+    return 0;
+}
+
+static int l_imgui_Button(lua_State* L) {
+    const char* label = luaL_checkstring(L, 1);
+    NSInteger tag = g_CurrentFrameButtonTag++;
+    bool clicked = (g_ClickedImGuiButtonTag == tag);
+    if (clicked) g_ClickedImGuiButtonTag = -1;
+
+    if (g_ScriptImGuiBuilding && g_ScriptImGuiStack) {
+        UIButton* btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        btn.tag = tag;
+        btn.backgroundColor = [UIColor colorWithRed:0.44 green:0.24 blue:0.78 alpha:1.0];
+        btn.layer.cornerRadius = 8.0;
+        [btn setTitle:[NSString stringWithUTF8String:Cp1251ToUtf8(label).c_str()] forState:UIControlStateNormal];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:12.5];
+        [btn addTarget:[LoaderUIHandler shared] action:@selector(onImGuiButtonTap:) forControlEvents:UIControlEventTouchUpInside];
+        [g_ScriptImGuiStack addArrangedSubview:btn];
+    }
+    lua_pushboolean(L, clicked ? 1 : 0);
+    return 1;
+}
+
+static int l_imgui_Noop(lua_State* L) { return 0; }
+
+static int l_imgui_OnFrame(lua_State* L) {
+    int drawIdx = lua_isfunction(L, 2) ? 2 : 1;
+    luaL_checktype(L, drawIdx, LUA_TFUNCTION);
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    LuaScriptInstance* inst = FindScriptByState(L);
+    if (inst) {
+        if (inst->renderCallbackRef != LUA_NOREF) luaL_unref(inst->L, LUA_REGISTRYINDEX, inst->renderCallbackRef);
+        lua_pushvalue(L, drawIdx);
+        inst->renderCallbackRef = luaL_ref(inst->L, LUA_REGISTRYINDEX);
+    }
+    return 0;
+}
+
 // ============================================================================
-// 9. MOONLOADER RUNTIME & LIBRARIES
+// 8. MOONLOADER BUILT-IN RUNTIME & LIBRARIES
 // ============================================================================
 
 static const char* kMoonLoaderBootstrapLua = R"lua(
@@ -1322,37 +1633,6 @@ package.preload["mimgui"] = function()
 end
 )lua";
 
-static int l_imgui_Begin(lua_State* L) {
-    const char* name = luaL_checkstring(L, 1);
-    bool open = true, hasClose = lua_isboolean(L, 2);
-    if (hasClose) open = lua_toboolean(L, 2);
-    lua_pushboolean(L, ImGui::Begin(name, hasClose ? &open : nullptr));
-    if (hasClose) { lua_pushboolean(L, open); return 2; }
-    return 1;
-}
-static int l_imgui_End(lua_State* L) { ImGui::End(); return 0; }
-static int l_imgui_Text(lua_State* L) {
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextUnformatted(luaL_checkstring(L, 1));
-    ImGui::PopTextWrapPos();
-    return 0;
-}
-static int l_imgui_Button(lua_State* L) { lua_pushboolean(L, ImGui::Button(luaL_checkstring(L, 1))); return 1; }
-static int l_imgui_SameLine(lua_State* L) { ImGui::SameLine(); return 0; }
-static int l_imgui_Separator(lua_State* L) { ImGui::Separator(); return 0; }
-static int l_imgui_OnFrame(lua_State* L) {
-    int drawIdx = lua_isfunction(L, 2) ? 2 : 1;
-    luaL_checktype(L, drawIdx, LUA_TFUNCTION);
-    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-    LuaScriptInstance* inst = FindScriptByState(L);
-    if (inst) {
-        if (inst->renderCallbackRef != LUA_NOREF) luaL_unref(inst->L, LUA_REGISTRYINDEX, inst->renderCallbackRef);
-        lua_pushvalue(L, drawIdx);
-        inst->renderCallbackRef = luaL_ref(inst->L, LUA_REGISTRYINDEX);
-    }
-    return 0;
-}
-
 static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const std::string& fullPath) {
     luaL_openlibs(L);
     std::string base = GetBaseDir();
@@ -1416,8 +1696,8 @@ static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const s
     lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "Text");
     lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "TextWrapped");
     lua_pushcfunction(L, l_imgui_Button); lua_setfield(L, -2, "Button");
-    lua_pushcfunction(L, l_imgui_SameLine); lua_setfield(L, -2, "SameLine");
-    lua_pushcfunction(L, l_imgui_Separator); lua_setfield(L, -2, "Separator");
+    lua_pushcfunction(L, l_imgui_Noop); lua_setfield(L, -2, "SameLine");
+    lua_pushcfunction(L, l_imgui_Noop); lua_setfield(L, -2, "Separator");
     lua_pushcfunction(L, l_imgui_OnFrame); lua_setfield(L, -2, "OnFrame");
     lua_setglobal(L, "imgui");
 
@@ -1435,7 +1715,7 @@ static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const s
 }
 
 // ============================================================================
-// 10. SCRIPT LOADING, RELOADING & TICKING
+// 9. SCRIPT LOADING, RELOADING & TICKING
 // ============================================================================
 
 static void UnloadSingleScript(LuaScriptInstance* inst) {
@@ -1537,15 +1817,20 @@ static void ReloadAllScripts() {
         : (okCount > 0
             ? [NSString stringWithFormat:@"42Loader: Загружено скриптов: %d (команд: %zu)", okCount, g_ChatCommands.size()]
             : @"42Loader: Активен (скриптов не найдено)");
-    ShowLauncherBanner(bannerMsg, errCount > 0);
+    uint32_t accent = (errCount > 0) ? 0xFFE53935 : 0xFF9B59B6;
+    ShowBannerOnWindow(@"", bannerMsg, accent, 3.8, 424242);
+    RefreshMenuContent();
 }
 
 static void TickScripts() {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     uint64_t now = NowMs();
 
+    g_ScriptImGuiVisibleThisFrame = false;
+
     for (auto* s : g_Scripts) {
         if (!s->enabled || !s->L || s->hasError) continue;
+
         for (size_t i = 0; i < s->threads.size(); ) {
             LuaCoroutine& t = s->threads[i];
             if (t.finished || t.suspended || now < t.wakeTimeMs) { i++; continue; }
@@ -1569,229 +1854,148 @@ static void TickScripts() {
                 s->threads.erase(s->threads.begin() + i);
             }
         }
+
+        if (s->enabled && s->L && !s->hasError && s->renderCallbackRef != LUA_NOREF) {
+            lua_rawgeti(s->L, LUA_REGISTRYINDEX, s->renderCallbackRef);
+            if (lua_pcall(s->L, 0, 0, 0) != LUA_OK) {
+                s->hasError = true;
+                s->lastError = lua_tostring(s->L, -1) ?: "ImGui render error";
+                lua_pop(s->L, 1);
+            }
+        }
+    }
+
+    if (!g_ScriptImGuiVisibleThisFrame && g_ScriptImGuiWindow) {
+        g_ScriptImGuiWindow.hidden = YES;
     }
 }
 
 // ============================================================================
-// 11. DEAR IMGUI OVERLAY
+// 10. UIKIT HANDLER IMPLEMENTATION & ENTRY POINT
 // ============================================================================
 
-static void RenderLoaderUI() {
+@implementation LoaderUIHandler
+
++ (instancetype)shared {
+    static LoaderUIHandler* inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ inst = [[LoaderUIHandler alloc] init]; });
+    return inst;
+}
+
+- (void)onFloatingBtnTap:(UIButton*)sender {
+    ToggleLoaderMenu();
+}
+
+- (void)onFloatingBtnPan:(UIPanGestureRecognizer*)pan {
+    UIView* btn = pan.view;
+    UIView* parent = btn.superview;
+    if (!btn || !parent) return;
+    CGPoint delta = [pan translationInView:parent];
+    CGPoint center = CGPointMake(btn.center.x + delta.x, btn.center.y + delta.y);
+    CGFloat halfW = btn.bounds.size.width * 0.5;
+    CGFloat halfH = btn.bounds.size.height * 0.5;
+    center.x = MAX(halfW + 6.0, MIN(parent.bounds.size.width - halfW - 6.0, center.x));
+    center.y = MAX(halfH + 6.0, MIN(parent.bounds.size.height - halfH - 6.0, center.y));
+    btn.center = center;
+    [pan setTranslation:CGPointZero inView:parent];
+}
+
+- (void)onCloseMenu:(UIButton*)sender {
+    if (g_MenuOpen) ToggleLoaderMenu();
+}
+
+- (void)onTabChanged:(UISegmentedControl*)seg {
+    g_SelectedTab = static_cast<int>(seg.selectedSegmentIndex);
+    RefreshMenuContent();
+}
+
+- (void)onActionBtnTap:(UIButton*)sender {
+    if (g_SelectedTab == 0) {
+        ReloadAllScripts();
+    } else if (g_SelectedTab == 1) {
+        if (g_MenuCmdField.text.length > 0) {
+            std::string cmd([g_MenuCmdField.text UTF8String]);
+            g_MenuCmdField.text = @"";
+            [g_MenuCmdField resignFirstResponder];
+            TryExecuteChatCommand(cmd, "MenuInput");
+            RefreshMenuContent();
+        }
+    } else if (g_SelectedTab == 2) {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        g_ConsoleLogs.clear();
+        RefreshMenuContent();
+    }
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField*)textField {
+    if (textField == g_MenuCmdField && textField.text.length > 0) {
+        std::string cmd([textField.text UTF8String]);
+        textField.text = @"";
+        [textField resignFirstResponder];
+        TryExecuteChatCommand(cmd, "MenuInput");
+        RefreshMenuContent();
+        return NO;
+    }
+    return YES;
+}
+
+- (void)onScriptSwitchChanged:(UISwitch*)sw {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    size_t idx = static_cast<size_t>(sw.tag);
+    if (idx < g_Scripts.size()) {
+        g_Scripts[idx]->enabled = sw.on;
+        if (sw.on) LoadSingleScript(g_Scripts[idx]);
+        else UnloadSingleScript(g_Scripts[idx]);
+    }
+    RefreshMenuContent();
+}
+
+- (void)onScriptReloadTap:(UIButton*)btn {
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    size_t idx = static_cast<size_t>(btn.tag);
+    if (idx < g_Scripts.size()) {
+        g_Scripts[idx]->enabled = true;
+        LoadSingleScript(g_Scripts[idx]);
+    }
+    RefreshMenuContent();
+}
+
+- (void)onImGuiCloseTap:(UIButton*)btn {
+    if (g_ScriptImGuiWindow) g_ScriptImGuiWindow.hidden = YES;
+}
+
+- (void)onImGuiButtonTap:(UIButton*)btn {
+    g_ClickedImGuiButtonTag = btn.tag;
+}
+
+- (void)onDisplayLink:(CADisplayLink*)link {
     TickScripts();
 
-    ImGuiIO& io = ImGui::GetIO();
-    float screenW = io.DisplaySize.x;
-    float screenH = io.DisplaySize.y;
-
-    float totalLuaKB = 0.0f;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        for (auto* s : g_Scripts) {
-            if (s->L) totalLuaKB += static_cast<float>(lua_gc(s->L, LUA_GCCOUNT, 0));
+    uint64_t now = NowMs();
+    if (now - g_LastUiRefreshMs > 500) {
+        g_LastUiRefreshMs = now;
+        EnsureFloatingMenuButton();
+        if (g_MenuOpen && g_SelectedTab == 2) {
+            RefreshMenuContent();
         }
     }
-    char ramStr[96];
-    snprintf(ramStr, sizeof(ramStr), "Loader RAM: %.2f MB (Lua: %.0f KB)", GetLoaderRAM_MB(), totalLuaKB);
-    ImGui::GetForegroundDrawList()->AddText(ImVec2(screenW - 245, screenH * 0.48f), IM_COL32(220, 220, 230, 180), ramStr);
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        uint64_t now = NowMs();
-        float ny = 24.0f;
-        for (size_t i = 0; i < g_Notifications.size(); ) {
-            if (now > g_Notifications[i].expireMs) { g_Notifications.erase(g_Notifications.begin() + i); continue; }
-            ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f - 170.0f, ny), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(340.0f, 0.0f), ImGuiCond_Always);
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.10f, 0.18f, 0.92f));
-            char winName[32];
-            snprintf(winName, sizeof(winName), "##Notif_%zu", i);
-            if (ImGui::Begin(winName, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs)) {
-                ImGui::PushTextWrapPos(0.0f);
-                ImGui::TextColored(ImVec4(0.68f, 0.45f, 0.98f, 1.0f), "%s", g_Notifications[i].title.c_str());
-                ImGui::TextUnformatted(g_Notifications[i].message.c_str());
-                ImGui::PopTextWrapPos();
-                ny += ImGui::GetWindowHeight() + 6.0f;
-            }
-            ImGui::End();
-            ImGui::PopStyleColor();
-            i++;
-        }
-
-        for (auto* s : g_Scripts) {
-            if (s->enabled && s->L && !s->hasError && s->renderCallbackRef != LUA_NOREF) {
-                lua_rawgeti(s->L, LUA_REGISTRYINDEX, s->renderCallbackRef);
-                if (lua_pcall(s->L, 0, 0, 0) != LUA_OK) {
-                    s->hasError = true;
-                    s->lastError = lua_tostring(s->L, -1) ?: "ImGui render error";
-                    lua_pop(s->L, 1);
-                }
-            }
-        }
-    }
-
-    if (!g_MenuOpen) return;
-
-    ImGui::SetNextWindowPos(ImVec2(screenW * 0.5f - 260.0f, 36.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 310.0f), ImGuiCond_FirstUseEver);
-    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.32f, 0.18f, 0.52f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.09f, 0.14f, 0.95f));
-
-    if (ImGui::Begin("Arizona 42Loader  |  Lua 5.4 + MoonLoader API", &g_MenuOpen)) {
-        if (ImGui::Button("Scripts")) g_SelectedTab = 0;
-        ImGui::SameLine();
-        if (ImGui::Button("Commands")) g_SelectedTab = 1;
-        ImGui::SameLine();
-        if (ImGui::Button("Console")) g_SelectedTab = 2;
-        ImGui::SameLine();
-        if (ImGui::Button("Settings")) g_SelectedTab = 3;
-        ImGui::Separator();
-
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-
-        if (g_SelectedTab == 0) {
-            if (ImGui::Button("Reload All Scripts")) ReloadAllScripts();
-            ImGui::SameLine();
-            ImGui::TextDisabled("Dir: Documents/lua_loader/scripts");
-            ImGui::Separator();
-
-            ImGui::BeginChild("##ScriptsList", ImVec2(0, 0), false);
-            for (size_t i = 0; i < g_Scripts.size(); i++) {
-                LuaScriptInstance* s = g_Scripts[i];
-                ImGui::PushID(static_cast<int>(i));
-                bool prev = s->enabled;
-                if (ImGui::Checkbox("##en", &s->enabled) && prev != s->enabled) {
-                    if (s->enabled) LoadSingleScript(s); else UnloadSingleScript(s);
-                }
-                ImGui::SameLine();
-                ImGui::TextUnformatted(s->filename.c_str());
-                ImGui::SameLine();
-                if (s->hasError) ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "[ERROR]");
-                else if (s->enabled) ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "[OK]");
-                else ImGui::TextDisabled("[OFF]");
-                ImGui::SameLine();
-                if (ImGui::Button("Reload")) { s->enabled = true; LoadSingleScript(s); }
-
-                if (s->hasError && !s->lastError.empty()) {
-                    ImGui::Indent(24.0f);
-                    ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", ShortenPathForUI(s->lastError).c_str());
-                    ImGui::PopTextWrapPos();
-                    ImGui::Unindent(24.0f);
-                }
-                ImGui::PopID();
-            }
-            ImGui::EndChild();
-        } else if (g_SelectedTab == 1) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted("Открытие меню: кнопка '42' или /42, /42loader, /luasettings в чате. Команды скриптов:");
-            ImGui::PopTextWrapPos();
-            ImGui::Separator();
-            for (const auto& kv : g_ChatCommands) {
-                ImGui::BulletText("/%s  (%s)", kv.first.c_str(), kv.second.scriptName.c_str());
-            }
-            ImGui::Separator();
-            ImGui::InputText("##TestCmd", g_CmdInputBuf, sizeof(g_CmdInputBuf));
-            ImGui::SameLine();
-            if (ImGui::Button("Выполнить") && strlen(g_CmdInputBuf) > 0) {
-                TryExecuteChatCommand(g_CmdInputBuf, "MenuInput");
-                g_CmdInputBuf[0] = '\0';
-            }
-        } else if (g_SelectedTab == 2) {
-            if (ImGui::Button("Clear Console")) g_ConsoleLogs.clear();
-            ImGui::Separator();
-            ImGui::BeginChild("##ConsoleScroll", ImVec2(0, 0), true);
-            ImGui::PushTextWrapPos(0.0f);
-            for (const auto& line : g_ConsoleLogs) {
-                if (line.find("ERROR") != std::string::npos) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "%s", line.c_str());
-                else ImGui::TextUnformatted(line.c_str());
-            }
-            ImGui::PopTextWrapPos();
-            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
-            ImGui::EndChild();
-        } else if (g_SelectedTab == 3) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::Text("Время мира: %02d:%02d | Погода ID: %d", g_WorldHour, g_WorldMinute, g_WorldWeather);
-            ImGui::Text("Активных скриптов: %zu | Команд в чате: %zu", g_Scripts.size(), g_ChatCommands.size());
-            ImGui::PopTextWrapPos();
-        }
-    }
-    ImGui::End();
-    ImGui::PopStyleColor(2);
 }
 
-// ============================================================================
-// 12. SAFE METAL HOOK & ENTRY POINT
-// ============================================================================
-
-static bool g_ImGuiInitialized = false;
-
-static void SetupImGuiWithDevice(id<MTLDevice> device) {
-    if (g_ImGuiInitialized || !device) return;
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::StyleColorsDark();
-    ImGui_ImplMetal_Init(device);
-    g_ImGuiInitialized = true;
-}
-
-static void (*orig_presentDrawable)(id, SEL, id<MTLDrawable>) = nullptr;
-static void swizzled_presentDrawable(id self, SEL _cmd, id<MTLDrawable> drawable) {
-    EnsureFloatingMenuButton();
-
-    if (g_ImGuiInitialized && drawable && [drawable respondsToSelector:@selector(texture)]) {
-        id<MTLTexture> tex = [(id)drawable texture];
-        UIWindow* keyWin = GetActiveKeyWindow();
-        if (keyWin && tex && tex.pixelFormat != MTLPixelFormatInvalid && tex.width > 0 && tex.height > 0) {
-            ImGuiIO& io = ImGui::GetIO();
-            CGFloat scale = [UIScreen mainScreen].scale;
-            io.DisplaySize = ImVec2(keyWin.bounds.size.width, keyWin.bounds.size.height);
-            io.DisplayFramebufferScale = ImVec2(scale, scale);
-
-            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-            rpd.colorAttachments[0].texture = tex;
-            rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-
-            id<MTLCommandBuffer> cmdBuf = (id<MTLCommandBuffer>)self;
-            id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
-            if (enc) {
-                ImGui_ImplMetal_NewFrame(rpd);
-                ImGui::NewFrame();
-                RenderLoaderUI();
-                ImGui::Render();
-                ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cmdBuf, enc);
-                [enc endEncoding];
-            }
-        }
-    }
-    if (orig_presentDrawable) orig_presentDrawable(self, _cmd, drawable);
-}
+@end
 
 __attribute__((constructor))
 static void LoaderEntry() {
     EnsureDirectories();
-    // Safe: only rebinds writable __DATA in app bundle images (never __DATA_CONST)
-    _dyld_register_func_for_add_image(RebindWritableDataInImage);
 
-    // Defer UIKit delegate swizzling & Metal setup until UIApplication is fully booted
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        InstallUIKitTextFieldHooks();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        InstallSafeUIKitChatHooks();
         EnsureFloatingMenuButton();
         ReloadAllScripts();
 
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        if (dev) {
-            SetupImGuiWithDevice(dev);
-            id<MTLCommandQueue> queue = [dev newCommandQueue];
-            id<MTLCommandBuffer> buf = [queue commandBuffer];
-            if (buf) {
-                Method m = class_getInstanceMethod([buf class], @selector(presentDrawable:));
-                if (m && method_getImplementation(m) != (IMP)swizzled_presentDrawable) {
-                    orig_presentDrawable = (void (*)(id, SEL, id<MTLDrawable>))method_getImplementation(m);
-                    method_setImplementation(m, (IMP)swizzled_presentDrawable);
-                }
-            }
-        }
-        LogConsole("Arizona 42Loader готов (Кнопка '42' + Чат-команды + Баннер активны)");
+        g_DisplayLink = [CADisplayLink displayLinkWithTarget:[LoaderUIHandler shared] selector:@selector(onDisplayLink:)];
+        [g_DisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+        LogConsole("Arizona 42Loader готов (UIKit меню + Кнопка '42' + Чат-команды активны)");
     });
 }
