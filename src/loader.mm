@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
@@ -163,6 +164,9 @@ static std::vector<RenderCommand> g_RenderCommands;
 static std::vector<ImGuiTouchEvent> g_ImGuiTouchEvents;
 static std::vector<CGRect> g_ImGuiInteractiveRects;
 static UIView* g_ImGuiTouchView = nil;
+static MTKView* g_StandaloneImGuiView = nil;
+static id<MTLCommandQueue> g_OverlayCommandQueue = nil;
+static id g_ImGuiRendererDelegate = nil;
 
 static bool g_MenuOpen = false;
 static int g_SelectedTab = 0;
@@ -181,9 +185,12 @@ static bool g_OwnerThreadWarningLogged = false;
 static ImVec4 g_AccentColor = ImVec4(0.62f, 0.38f, 0.95f, 1.0f);
 
 static UIButton* g_FloatingMenuButton = nullptr;
+static UIButton* g_SecondaryFloatingMenuButton = nullptr;
 static CGFloat g_OverlayDisplayWidth = 0;
 static CGFloat g_OverlayDisplayHeight = 0;
 static CGFloat g_OverlayScale = 1;
+static bool g_ImGuiInitialized = false;
+static uint64_t g_ImGuiFrameCount = 0;
 
 static void* BoundedLuaAllocator(void* userData, void* pointer, size_t oldSize, size_t newSize) {
     LuaAllocatorState* state = static_cast<LuaAllocatorState*>(userData);
@@ -260,6 +267,12 @@ static void RefreshFloatingButtonTheme() {
         g_FloatingMenuButton.backgroundColor = open
             ? LoaderAccentUIColor()
             : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+        if (g_SecondaryFloatingMenuButton) {
+            g_SecondaryFloatingMenuButton.layer.borderColor = LoaderAccentUIColor().CGColor;
+            g_SecondaryFloatingMenuButton.backgroundColor = open
+                ? LoaderAccentUIColor()
+                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+        }
     });
 }
 
@@ -330,22 +343,26 @@ static UIWindow* GetActiveKeyWindow() {
 }
 
 static void ToggleLoaderMenu() {
+    bool isOpen = false;
     {
         std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
         g_MenuOpen = !g_MenuOpen;
+        isOpen = g_MenuOpen;
     }
+    LogConsole(isOpen ? "[UI] Loader menu opened" : "[UI] Loader menu closed");
     dispatch_async(dispatch_get_main_queue(), ^{
-        bool isOpen = false;
-        {
-            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-            isOpen = g_MenuOpen;
-        }
         UIColor* accent = LoaderAccentUIColor();
         if (g_FloatingMenuButton) {
             g_FloatingMenuButton.backgroundColor = isOpen
                 ? accent
                 : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
             g_FloatingMenuButton.layer.borderColor = accent.CGColor;
+        }
+        if (g_SecondaryFloatingMenuButton) {
+            g_SecondaryFloatingMenuButton.backgroundColor = isOpen
+                ? accent
+                : [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+            g_SecondaryFloatingMenuButton.layer.borderColor = accent.CGColor;
         }
     });
 }
@@ -398,11 +415,17 @@ static void ToggleLoaderMenu() {
 
 @interface LoaderFloatingBtnHandler : NSObject
 + (void)onTap:(UIButton*)sender;
++ (void)onTap24:(UIButton*)sender;
 + (void)onPan:(UIPanGestureRecognizer*)pan;
 @end
 
 @implementation LoaderFloatingBtnHandler
 + (void)onTap:(UIButton*)sender {
+    (void)sender;
+    ToggleLoaderMenu();
+}
+
++ (void)onTap24:(UIButton*)sender {
     (void)sender;
     ToggleLoaderMenu();
 }
@@ -428,18 +451,6 @@ static void EnsureFloatingMenuButton() {
         UIWindow* win = GetActiveKeyWindow();
         if (!win) return;
 
-        if (g_FloatingMenuButton) {
-            if (g_ImGuiTouchView && g_ImGuiTouchView.superview != win) {
-                g_ImGuiTouchView.frame = win.bounds;
-                [win addSubview:g_ImGuiTouchView];
-            }
-            if (g_FloatingMenuButton.superview != win) {
-                [win addSubview:g_FloatingMenuButton];
-            }
-            [win bringSubviewToFront:g_FloatingMenuButton];
-            return;
-        }
-
         if (!g_ImGuiTouchView) {
             g_ImGuiTouchView = [[LoaderImGuiTouchView alloc] initWithFrame:win.bounds];
             g_ImGuiTouchView.backgroundColor = UIColor.clearColor;
@@ -450,37 +461,66 @@ static void EnsureFloatingMenuButton() {
         g_OverlayDisplayWidth = win.bounds.size.width;
         g_OverlayDisplayHeight = win.bounds.size.height;
         g_OverlayScale = win.screen.scale ?: 1.0;
-        UIButton* btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.tag = 424200;
-        btn.frame = CGRectMake(18.0, 52.0, 48.0, 48.0);
-        btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
-        btn.layer.cornerRadius = 24.0;
-        btn.layer.borderWidth = 1.5;
-        btn.layer.borderColor = LoaderAccentUIColor().CGColor;
-        btn.layer.shadowColor = [UIColor blackColor].CGColor;
-        btn.layer.shadowOpacity = 0.45;
-        btn.layer.shadowRadius = 6.0;
-        btn.layer.shadowOffset = CGSizeMake(0, 2);
-        [btn setTitle:@"42" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+        if (!g_FloatingMenuButton) {
+            UIButton* btn = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn.tag = 424200;
+            btn.frame = CGRectMake(18.0, 52.0, 48.0, 48.0);
+            btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+            btn.layer.cornerRadius = 24.0;
+            btn.layer.borderWidth = 1.5;
+            btn.layer.borderColor = LoaderAccentUIColor().CGColor;
+            btn.layer.shadowColor = [UIColor blackColor].CGColor;
+            btn.layer.shadowOpacity = 0.45;
+            btn.layer.shadowRadius = 6.0;
+            btn.layer.shadowOffset = CGSizeMake(0, 2);
+            [btn setTitle:@"42" forState:UIControlStateNormal];
+            [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            btn.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+            btn.accessibilityLabel = @"Open or close 42Loader menu";
 
-        [btn addTarget:[LoaderFloatingBtnHandler class]
-                action:@selector(onTap:)
-      forControlEvents:UIControlEventTouchUpInside];
+            [btn addTarget:[LoaderFloatingBtnHandler class]
+                    action:@selector(onTap:)
+          forControlEvents:UIControlEventTouchUpInside];
 
-        UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:[LoaderFloatingBtnHandler class]
-                                                                              action:@selector(onPan:)];
-        // Keep UIButton's touch-up-inside action alive when the drag recognizer
-        // decides that a stationary press was not a drag.
-        pan.cancelsTouchesInView = NO;
-        pan.delaysTouchesBegan = NO;
-        pan.delaysTouchesEnded = NO;
-        [btn addGestureRecognizer:pan];
+            UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:[LoaderFloatingBtnHandler class]
+                                                                                  action:@selector(onPan:)];
+            pan.cancelsTouchesInView = NO;
+            pan.delaysTouchesBegan = NO;
+            pan.delaysTouchesEnded = NO;
+            [btn addGestureRecognizer:pan];
+            g_FloatingMenuButton = btn;
+        }
 
-        [win addSubview:btn];
-        [win bringSubviewToFront:btn];
-        g_FloatingMenuButton = btn;
+        if (!g_SecondaryFloatingMenuButton) {
+            UIButton* btn24 = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn24.tag = 242400;
+            btn24.frame = CGRectMake(18.0, 108.0, 48.0, 48.0);
+            btn24.backgroundColor = [UIColor colorWithRed:0.15 green:0.11 blue:0.25 alpha:0.90];
+            btn24.layer.cornerRadius = 24.0;
+            btn24.layer.borderWidth = 1.5;
+            btn24.layer.borderColor = LoaderAccentUIColor().CGColor;
+            btn24.layer.shadowColor = [UIColor blackColor].CGColor;
+            btn24.layer.shadowOpacity = 0.45;
+            btn24.layer.shadowRadius = 6.0;
+            btn24.layer.shadowOffset = CGSizeMake(0, 2);
+            [btn24 setTitle:@"24" forState:UIControlStateNormal];
+            [btn24 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            btn24.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+            btn24.accessibilityLabel = @"Open or close 42Loader menu";
+            [btn24 addTarget:[LoaderFloatingBtnHandler class]
+                      action:@selector(onTap24:)
+            forControlEvents:UIControlEventTouchUpInside];
+            g_SecondaryFloatingMenuButton = btn24;
+        }
+
+        if (g_ImGuiTouchView.superview != win) {
+            g_ImGuiTouchView.frame = win.bounds;
+            [win addSubview:g_ImGuiTouchView];
+        }
+        if (g_FloatingMenuButton.superview != win) [win addSubview:g_FloatingMenuButton];
+        if (g_SecondaryFloatingMenuButton.superview != win) [win addSubview:g_SecondaryFloatingMenuButton];
+        [win bringSubviewToFront:g_FloatingMenuButton];
+        [win bringSubviewToFront:g_SecondaryFloatingMenuButton];
     };
     if ([NSThread isMainThread]) ensureButton();
     else dispatch_async(dispatch_get_main_queue(), ensureButton);
@@ -2294,12 +2334,88 @@ static void RenderLoaderUI() {
     ImGui::PopStyleColor(5);
 }
 
+// Render into a transparent Metal view above the game's own UIKit/Metal view
+// hierarchy. Drawing into the game's drawable can leave the ImGui window
+// hidden behind a UIKit layer even though the floating UIKit button is visible.
+@interface LoaderImGuiRenderer : NSObject <MTKViewDelegate>
+@end
+
+@implementation LoaderImGuiRenderer
+- (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
+    (void)size;
+    std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+    g_OverlayDisplayWidth = view.bounds.size.width;
+    g_OverlayDisplayHeight = view.bounds.size.height;
+    g_OverlayScale = view.contentScaleFactor ?: 1.0;
+}
+
+- (void)drawInMTKView:(MTKView*)view {
+    @autoreleasepool {
+        if (!g_ImGuiInitialized || !g_OverlayCommandQueue) return;
+        MTLRenderPassDescriptor* pass = view.currentRenderPassDescriptor;
+        id<CAMetalDrawable> drawable = view.currentDrawable;
+        if (!pass || !drawable) return;
+
+        id<MTLCommandBuffer> commandBuffer = [g_OverlayCommandQueue commandBuffer];
+        if (!commandBuffer) return;
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) return;
+
+        ImGuiIO& io = ImGui::GetIO();
+        CGFloat scale = view.contentScaleFactor ?: 1.0;
+        io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
+        io.DisplayFramebufferScale = ImVec2(scale, scale);
+        ImGui_ImplMetal_NewFrame(pass);
+        ApplyQueuedImGuiTouchEvents(io);
+        ImGui::NewFrame();
+        RenderLoaderUI();
+        ImGui::Render();
+        ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, encoder);
+        [encoder endEncoding];
+        [commandBuffer presentDrawable:drawable];
+        [commandBuffer commit];
+        if ((++g_ImGuiFrameCount % 600) == 1) {
+            LogConsole("[ImGui] Standalone overlay frame rendered");
+        }
+    }
+}
+@end
+
+static bool InstallStandaloneImGuiView(id<MTLDevice> device) {
+    UIWindow* window = GetActiveKeyWindow();
+    if (!window || !g_ImGuiTouchView || !device) return false;
+
+    g_OverlayCommandQueue = [device newCommandQueue];
+    if (!g_OverlayCommandQueue) return false;
+
+    MTKView* view = [[MTKView alloc] initWithFrame:window.bounds device:device];
+    if (!view) {
+        g_OverlayCommandQueue = nil;
+        return false;
+    }
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    view.opaque = NO;
+    view.backgroundColor = UIColor.clearColor;
+    view.layer.opaque = NO;
+    view.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    view.enableSetNeedsDisplay = NO;
+    view.paused = NO;
+    view.preferredFramesPerSecond = 60;
+    view.userInteractionEnabled = NO;
+
+    LoaderImGuiRenderer* renderer = [[LoaderImGuiRenderer alloc] init];
+    view.delegate = renderer;
+    [window insertSubview:view belowSubview:g_ImGuiTouchView];
+    g_ImGuiRendererDelegate = renderer;
+    g_StandaloneImGuiView = view;
+    LogConsole("[ImGui] Transparent standalone Metal overlay is rendering");
+    return true;
+}
+
 // ============================================================================
 // 9. METAL RENDER HOOK & ENTRY POINT
 // ============================================================================
-
-static bool g_ImGuiInitialized = false;
-static uint64_t g_ImGuiFrameCount = 0;
 
 static void SetupImGuiWithDevice(id<MTLDevice> device) {
     if (g_ImGuiInitialized || !device) return;
@@ -2314,7 +2430,7 @@ static void SetupImGuiWithDevice(id<MTLDevice> device) {
 }
 
 static void RenderImGuiOverlay(id self, id<MTLDrawable> drawable) {
-    if (!g_ImGuiInitialized || !drawable) return;
+    if (!g_ImGuiInitialized || !drawable || g_StandaloneImGuiView) return;
     if (g_ImGuiInitialized) {
         ImGuiIO& io = ImGui::GetIO();
         CGFloat width, height, scale;
@@ -2405,6 +2521,13 @@ static void LoaderEntry() {
         if (!g_ImGuiInitialized) {
             LogConsole("[ERROR] ImGui Metal backend initialization failed");
             return;
+        }
+
+        // Prefer an independent transparent overlay so game UIKit views cannot
+        // cover the ImGui menu. Keep the present hook as a fallback if MTKView
+        // setup is unavailable on a particular game build.
+        if (!InstallStandaloneImGuiView(dev)) {
+            LogConsole("[WARN] Standalone ImGui overlay unavailable; using game drawable hook");
         }
 
         id<MTLCommandQueue> queue = [dev newCommandQueue];

@@ -5,3 +5,4 @@
 *.dylib
 *.o
 LuaLoader-ios-arm64-package.zip
+/compiled/
