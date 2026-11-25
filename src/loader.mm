@@ -204,6 +204,7 @@ static std::atomic<bool> g_ArizonaChatInputHookAttempted{false};
 using ArizonaInputEndFn = void (*)(NSString*);
 static ArizonaInputEndFn g_OriginalArizonaInputEnd = nullptr;
 static std::mutex g_ArizonaChatHookMutex;
+static void InstallArizonaChatInputHook();
 
 static void* BoundedLuaAllocator(void* userData, void* pointer, size_t oldSize, size_t newSize) {
     LuaAllocatorState* state = static_cast<LuaAllocatorState*>(userData);
@@ -358,6 +359,7 @@ static void ToggleLoaderMenu() {
     }
     LogConsole(isOpen ? "[UI] Loader menu opened" : "[UI] Loader menu closed");
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (isOpen) InstallArizonaChatInputHook();
         UIColor* accent = LoaderAccentUIColor();
         if (g_FloatingMenuButton) {
             g_FloatingMenuButton.hidden = isOpen;
@@ -2280,14 +2282,9 @@ static void RenderLoaderUI() {
             if (g_ArizonaChatInputHookInstalled.load()) {
                 ImGui::TextDisabled("Arizona input hook: active");
             } else if (!g_ArizonaChatInputHookAttempted.load()) {
-                ImGui::TextDisabled("Chat hook is off by default to keep startup stable.");
-                if (ImGui::Button("Connect registered commands to Arizona input")) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        InstallArizonaChatInputHook();
-                    });
-                }
+                ImGui::TextDisabled("Open the Loader menu once to connect chat commands.");
             } else {
-                ImGui::TextDisabled("Arizona input hook unavailable; Run executes callbacks locally.");
+                ImGui::TextDisabled("Arizona input hook unavailable; check Loader logs. Run remains local.");
             }
             ImGui::TextDisabled("Callbacks run on the Lua owner thread.");
             ImGui::PopTextWrapPos();

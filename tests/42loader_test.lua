@@ -1,6 +1,6 @@
 -- Arizona 42Loader diagnostic script.
--- Copy to Documents/lua_loader/scripts, enable the optional input hook in
--- Loader's Commands tab, then run /42test from Arizona chat or the Commands tab.
+-- Copy to Documents/lua_loader/scripts, open Loader once to enable chat input,
+-- then run /42test from Arizona chat or the Commands tab.
 -- HTTP is asynchronous and requires network access on the device.
 
 local testState = {
