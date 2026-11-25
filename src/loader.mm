@@ -590,8 +590,8 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     std::string key = ToLowerASCII(cmdName);
     if (key.empty()) return false;
 
-    // Built-in loader menu commands (/42, /42loader, /luasettings)
-    if (key == "42" || key == "42loader" || key == "luasettings") {
+    // Built-in local aliases; this dispatcher is not connected to Arizona chat.
+    if (key == "loader" || key == "42" || key == "42loader" || key == "luasettings") {
         ToggleLoaderMenu();
         LogConsole(std::string("[Command:") + sourceTag + "] Loader menu toggled with /" + key);
         return true;
@@ -782,6 +782,8 @@ static int l_sampRegisterChatCommand(lua_State* L) {
     if (cmd.empty() || cmd.size() > 64 ||
         !std::all_of(cmd.begin(), cmd.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; }))
         return luaL_error(L, "chat command names must contain 1-64 ASCII letters, digits, or underscores");
+    if (cmd == "loader" || cmd == "42" || cmd == "42loader" || cmd == "luasettings")
+        return luaL_error(L, "command name is reserved by 42Loader");
 
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     LuaScriptInstance* inst = FindScriptByState(L);
@@ -1291,210 +1293,6 @@ function _DISPATCH_SAMP_EVENT(name, ...)
     end
 end
 
-package.preload["inicfg"] = function()
-    local inicfg = {}
-    local cfgDir = getWorkingDirectory() .. "/config/"
-
-    local function resolvePath(filename)
-        if not filename then filename = "default.ini" end
-        if filename:find("^/") then return filename end
-        if not filename:match("%.ini$") then filename = filename .. ".ini" end
-        return cfgDir .. filename
-    end
-
-    local function deepCopy(t)
-        local r = {}
-        for k, v in pairs(t or {}) do
-            r[k] = type(v) == "table" and deepCopy(v) or v
-        end
-        return r
-    end
-
-    function inicfg.load(defaultTbl, filename)
-        local data = deepCopy(defaultTbl)
-        local path = resolvePath(filename)
-        local f = io.open(path, "r")
-        if not f then return data end
-        local section = nil
-        for line in f:lines() do
-            line = line:gsub("\r$", "")
-            local sec = line:match("^%s*%[([^%]]+)%]%s*$")
-            if sec then
-                section = sec
-                data[section] = data[section] or {}
-            else
-                local k, v = line:match("^%s*([^=;#]+)%s*=%s*(.-)%s*$")
-                if k and v then
-                    local target = section and (data[section] or {}) or data
-                    if section then data[section] = target end
-                    if v == "true" then target[k] = true
-                    elseif v == "false" then target[k] = false
-                    elseif tonumber(v) then target[k] = tonumber(v)
-                    else target[k] = v end
-                end
-            end
-        end
-        f:close()
-        return data
-    end
-
-    function inicfg.save(data, filename)
-        local path = resolvePath(filename)
-        local f = io.open(path, "w")
-        if not f then return false end
-        for k, v in pairs(data or {}) do
-            if type(v) == "table" then
-                f:write("[" .. tostring(k) .. "]\n")
-                for sk, sv in pairs(v) do
-                    f:write(tostring(sk) .. "=" .. tostring(sv) .. "\n")
-                end
-                f:write("\n")
-            else
-                f:write(tostring(k) .. "=" .. tostring(v) .. "\n")
-            end
-        end
-        f:close()
-        return true
-    end
-
-    return inicfg
-end
-
-package.preload["encoding"] = function()
-    local encoding = { default = "CP1251" }
-    local function makeEncoding(convert, reverse)
-        return setmetatable({}, {
-            __call = function(_, s) return convert(tostring(s or "")) end,
-            __index = {
-                decode = function(_, s) return convert(tostring(s or "")) end,
-                encode = function(_, s) return reverse(tostring(s or "")) end
-            }
-        })
-    end
-    encoding.UTF8 = makeEncoding(__az_cp1251_to_utf8, __az_utf8_to_cp1251)
-    encoding.CP1251 = makeEncoding(__az_utf8_to_cp1251, __az_cp1251_to_utf8)
-    return encoding
-end
-
-local _json_null = setmetatable({}, { __tostring = function() return "null" end })
-local function _json_encode(val)
-    local t = type(val)
-    if val == _json_null or val == nil then return "null"
-    elseif t == "boolean" then return val and "true" or "false"
-    elseif t == "number" then
-        if val ~= val or val == math.huge or val == -math.huge then
-            error("non-finite numbers are not valid JSON", 2)
-        end
-        return tostring(val)
-    elseif t == "string" then
-        return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\b', '\\b'):gsub('\f', '\\f'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t'):gsub('%c', function(c) return string.format('\\u%04x', c:byte()) end) .. '"'
-    elseif t == "table" then
-        local isArr = (#val > 0)
-        local parts = {}
-        if isArr then
-            for i = 1, #val do parts[#parts + 1] = _json_encode(val[i]) end
-            return "[" .. table.concat(parts, ",") .. "]"
-        else
-            for k, v in pairs(val) do
-                parts[#parts + 1] = _json_encode(tostring(k)) .. ":" .. _json_encode(v)
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-    end
-    error("unsupported value in JSON encode: " .. t, 2)
-end
-
-local function _json_decode(str)
-    if type(str) ~= "string" then error("JSON decode expects a string", 2) end
-    local i, n = 1, #str
-    local function fail(message) error("JSON decode error at byte " .. i .. ": " .. message, 0) end
-    local function skipws()
-        while i <= n and str:sub(i, i):match("%s") do i = i + 1 end
-    end
-    local function parseString()
-        if str:sub(i, i) ~= '"' then fail("expected string") end
-        i = i + 1
-        local out, start = {}, i
-        while i <= n do
-            local c = str:sub(i, i)
-            if c == '"' then
-                out[#out + 1] = str:sub(start, i - 1)
-                i = i + 1
-                return table.concat(out)
-            elseif c == "\\" then
-                out[#out + 1] = str:sub(start, i - 1)
-                i = i + 1
-                local e = str:sub(i, i)
-                local simple = { ['"']='"', ['\\']='\\', ['/']='/', b='\b', f='\f', n='\n', r='\r', t='\t' }
-                if simple[e] then
-                    out[#out + 1] = simple[e]
-                    i = i + 1
-                elseif e == "u" then
-                    local hex = str:sub(i + 1, i + 4)
-                    local cp = tonumber(hex, 16)
-                    if not cp or #hex ~= 4 then fail("invalid unicode escape") end
-                    i = i + 5
-                    if cp >= 0xD800 and cp <= 0xDBFF and str:sub(i, i + 1) == "\\u" then
-                        local lowHex = str:sub(i + 2, i + 5)
-                        local low = tonumber(lowHex, 16)
-                        if not low or low < 0xDC00 or low > 0xDFFF then fail("invalid surrogate pair") end
-                        cp = 0x10000 + (cp - 0xD800) * 0x400 + low - 0xDC00
-                        i = i + 6
-                    elseif cp >= 0xD800 and cp <= 0xDFFF then fail("unpaired surrogate") end
-                    out[#out + 1] = utf8.char(cp)
-                else fail("invalid string escape") end
-                start = i
-            elseif c:byte() < 32 then fail("control character in string")
-            else i = i + 1 end
-        end
-        fail("unterminated string")
-    end
-    local parseValue
-    parseValue = function()
-        skipws()
-        local c = str:sub(i, i)
-        if c == '"' then return parseString()
-        elseif c == "{" then
-            i = i + 1; skipws()
-            local obj = {}
-            if str:sub(i, i) == "}" then i = i + 1; return obj end
-            while true do
-                skipws(); local key = parseString(); skipws()
-                if str:sub(i, i) ~= ":" then fail("expected ':'") end
-                i = i + 1; obj[key] = parseValue(); skipws()
-                local sep = str:sub(i, i); i = i + 1
-                if sep == "}" then return obj elseif sep ~= "," then fail("expected ',' or '}'") end
-            end
-        elseif c == "[" then
-            i = i + 1; skipws()
-            local arr = {}
-            if str:sub(i, i) == "]" then i = i + 1; return arr end
-            while true do
-                arr[#arr + 1] = parseValue(); skipws()
-                local sep = str:sub(i, i); i = i + 1
-                if sep == "]" then return arr elseif sep ~= "," then fail("expected ',' or ']' ") end
-            end
-        elseif str:sub(i, i + 3) == "true" then i = i + 4; return true
-        elseif str:sub(i, i + 4) == "false" then i = i + 5; return false
-        elseif str:sub(i, i + 3) == "null" then i = i + 4; return _json_null
-        else
-            local token = str:sub(i):match("^-?%d+%.?%d*[eE]?[%+%-]?%d*")
-            local valid = token and (token:match("^-?%d+$") or token:match("^-?%d+%.%d+$") or token:match("^-?%d+[eE][%+%-]?%d+$") or token:match("^-?%d+%.%d+[eE][%+%-]?%d+$"))
-            if valid and not token:match("^-?0%d") and tonumber(token) then i = i + #token; return tonumber(token) end
-            fail("expected a JSON value")
-        end
-    end
-    local value = parseValue(); skipws()
-    if i <= n then fail("trailing data") end
-    return value
-end
-
-encodeJson = _json_encode
-decodeJson = _json_decode
-local _json_mod = { encode = _json_encode, decode = _json_decode, null = _json_null }
-package.preload["cjson"] = function() return _json_mod end
-package.preload["json"] = function() return _json_mod end
-
 package.preload["vkeys"] = function()
     return {
         VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_BACK = 0x08, VK_TAB = 0x09,
@@ -1536,21 +1334,10 @@ package.preload["lfs"] = function()
     }
 end
 
-package.preload["mimgui"] = function()
-    local m = setmetatable({}, { __index = imgui })
-    m.new = {
-        bool = function(v) return { [0] = v or false } end,
-        int = function(v) return { [0] = v or 0 } end,
-        float = function(v) return { [0] = v or 0.0 } end,
-        char = setmetatable({}, { __index = function() return function(s) return { _val = s or "" } end end })
-    }
-    m.StrCopy = function(dst, src) if type(dst) == "table" then dst._val = tostring(src or "") end end
-    m.OnInitialize = function(fn) if type(fn) == "function" then fn() end end
-    return m
-end
-
-json = _json_mod
-cjson = _json_mod
+json = require("json")
+cjson = require("cjson")
+encodeJson = json.encode
+decodeJson = json.decode
 inicfg = require("inicfg")
 encoding = require("encoding")
 mimgui = require("mimgui")
@@ -1603,6 +1390,20 @@ static int l_imgui_Button(lua_State* L) {
     lua_pushboolean(L, ImGui::Button(label));
     return 1;
 }
+static int l_imgui_Checkbox(lua_State* L) {
+    const char* label = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_getfield(L, 2, "v");
+    bool value = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    bool changed = ImGui::Checkbox(label, &value);
+    if (changed) {
+        lua_pushboolean(L, value);
+        lua_setfield(L, 2, "v");
+    }
+    lua_pushboolean(L, changed);
+    return 1;
+}
 static int l_imgui_SameLine(lua_State* L) { ImGui::SameLine(); return 0; }
 static int l_imgui_Separator(lua_State* L) { ImGui::Separator(); return 0; }
 static int l_imgui_ImBool(lua_State* L) {
@@ -1621,6 +1422,22 @@ static int l_imgui_SliderFloat(lua_State* L) {
     bool changed = ImGui::SliderFloat(label, &value, minValue, maxValue);
     if (changed) { lua_pushnumber(L, value); lua_setfield(L, 2, "v"); }
     lua_pushboolean(L, changed); return 1;
+}
+static int l_imgui_SliderInt(lua_State* L) {
+    const char* label = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_getfield(L, 2, "v");
+    int value = static_cast<int>(luaL_optinteger(L, -1, 0));
+    lua_pop(L, 1);
+    int minValue = static_cast<int>(luaL_checkinteger(L, 3));
+    int maxValue = static_cast<int>(luaL_checkinteger(L, 4));
+    bool changed = ImGui::SliderInt(label, &value, minValue, maxValue);
+    if (changed) {
+        lua_pushinteger(L, value);
+        lua_setfield(L, 2, "v");
+    }
+    lua_pushboolean(L, changed);
+    return 1;
 }
 static int l_imgui_Slider(lua_State* L) {
     const char* label = luaL_checkstring(L, 1);
@@ -1642,6 +1459,12 @@ static int l_imgui_OnFrame(lua_State* L) {
         lua_pushvalue(L, drawIdx);
         inst->renderCallbackRef = luaL_ref(L, LUA_REGISTRYINDEX);
     }
+    lua_getglobal(L, "imgui");
+    if (lua_istable(L, -1)) {
+        lua_pushboolean(L, 1);
+        lua_setfield(L, -2, "Process");
+    }
+    lua_pop(L, 1);
     return 0;
 }
 
@@ -1739,16 +1562,45 @@ static void RenderQueuedPrimitives() {
     }
 }
 
+static void AppendLuaModulePaths(lua_State* L) {
+    lua_getglobal(L, "package");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_getfield(L, -1, "path");
+    size_t existingLength = 0;
+    const char* existingPath = lua_tolstring(L, -1, &existingLength);
+    std::string path = existingPath ? std::string(existingPath, existingLength) : std::string();
+    lua_pop(L, 1);
+
+    const std::string documentsLib = GetBaseDir() + "/lib";
+    NSString* resourcePath = [[NSBundle mainBundle] resourcePath];
+    const std::string bundleLib = resourcePath.UTF8String
+        ? std::string(resourcePath.UTF8String) + "/LoaderLib"
+        : std::string();
+    const std::vector<std::string> moduleDirs = { bundleLib, documentsLib };
+    for (const auto& dir : moduleDirs) {
+        if (dir.empty()) continue;
+        for (const char* pattern : { "/?.lua", "/?/init.lua" }) {
+            const std::string entry = dir + pattern;
+            if (path.find(entry) == std::string::npos) {
+                if (!path.empty()) path.push_back(';');
+                path += entry;
+            }
+        }
+    }
+
+    lua_pushlstring(L, path.data(), path.size());
+    lua_setfield(L, -2, "path");
+    lua_pop(L, 1);
+}
+
 static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const std::string& fullPath) {
     OpenSafeLuaLibraries(L);
 
-    std::string base = GetBaseDir();
-    std::string pkgCode = "package.path = package.path .. ';" + base + "/lib/?.lua;" + base + "/lib/?/init.lua'";
-    if (luaL_dostring(L, pkgCode.c_str()) != LUA_OK) {
-        const char* error = lua_tostring(L, -1);
-        LogConsole(std::string("[Package path ERROR] ") + (error ? error : "unknown error"));
-        lua_pop(L, 1);
-    }
+    AppendLuaModulePaths(L);
 
     lua_register(L, "print", l_print);
     lua_register(L, "wait", l_wait);
@@ -1821,12 +1673,14 @@ static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const s
     lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "Text");
     lua_pushcfunction(L, l_imgui_Text); lua_setfield(L, -2, "TextWrapped");
     lua_pushcfunction(L, l_imgui_Button); lua_setfield(L, -2, "Button");
+    lua_pushcfunction(L, l_imgui_Checkbox); lua_setfield(L, -2, "Checkbox");
     lua_pushcfunction(L, l_imgui_SameLine); lua_setfield(L, -2, "SameLine");
     lua_pushcfunction(L, l_imgui_Separator); lua_setfield(L, -2, "Separator");
     lua_pushcfunction(L, l_imgui_OnFrame); lua_setfield(L, -2, "OnFrame");
     lua_pushcfunction(L, l_imgui_ImBool); lua_setfield(L, -2, "ImBool");
     lua_pushcfunction(L, l_imgui_ImFloat); lua_setfield(L, -2, "ImFloat");
     lua_pushcfunction(L, l_imgui_SliderFloat); lua_setfield(L, -2, "SliderFloat");
+    lua_pushcfunction(L, l_imgui_SliderInt); lua_setfield(L, -2, "SliderInt");
     lua_pushcfunction(L, l_imgui_Slider); lua_setfield(L, -2, "Slider");
     lua_pushboolean(L, 0); lua_setfield(L, -2, "Process");
     lua_setglobal(L, "imgui");
@@ -2366,6 +2220,7 @@ static void RenderLoaderUI() {
         } else if (g_SelectedTab == 1) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted("Registered Lua commands. Run executes callbacks on the Lua owner thread.");
+            ImGui::TextUnformatted("Built-in local command /loader toggles this menu; Arizona game chat is not connected.");
             ImGui::TextDisabled("Game chat registration/output is unavailable: no verified Arizona chat API was found.");
             ImGui::PopTextWrapPos();
             ImGui::Separator();
