@@ -21,7 +21,8 @@ share one native context and render loop; copying a separate Android or
 standalone ImGui binary into this folder would not connect it to that context.
 
 Android game bridges, FFI, arbitrary process memory, D3D rendering, and live
-Loader consumes registered local slash commands through Arizona's `ui_input_end`
-input path and forwards unmatched text to the original game handler. Local chat
-message output is not supported because no verified in-game display API is
-available in the bundled iOS app.
+Scripts can register local slash commands with `sampRegisterChatCommand`. The
+optional Arizona `ui_input_end` hook is off at startup; enable it in Loader's
+Commands tab to consume registered commands and forward unmatched input to the
+game handler. Local chat message output is not supported because no verified
+in-game display API is available in the bundled iOS app.
