@@ -34,6 +34,14 @@ jobs:
           cp imgui-1.91.6/*.cpp imgui-1.91.6/*.h build/imgui/
           cp imgui-1.91.6/backends/imgui_impl_metal.h imgui-1.91.6/backends/imgui_impl_metal.mm build/imgui/backends/
 
+      - name: Download pinned Dobby hook library
+        run: |
+          mkdir -p build/dobby-src
+          curl -fsSL https://codeload.github.com/jmpews/Dobby/tar.gz/5dfc8546954ce3b3198132ab13fddb89ee92cdd7 -o dobby.tar.gz
+          tar -xzf dobby.tar.gz --strip-components=1 -C build/dobby-src
+          test -s build/dobby-src/include/dobby.h
+          test -s build/dobby-src/CMakeLists.txt
+
       - name: Compile Lua 5.4.7 & Dear ImGui (arm64 iOS)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -55,14 +63,35 @@ jobs:
             -std=c++17 -fobjc-arc -O2 -Ibuild/imgui -Ibuild/imgui/backends \
             -c build/imgui/backends/imgui_impl_metal.mm -o build/obj/imgui/imgui_impl_metal.o
 
+      - name: Build Dobby static library for iOS arm64
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cmake -S build/dobby-src -B build/dobby \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$SDK" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDOBBY_GENERATE_SHARED=OFF \
+            -DDOBBY_DEBUG=OFF \
+            -DPlugin.SymbolResolver=OFF \
+            -DNearBranch=ON \
+            -DDOBBY_BUILD_EXAMPLE=OFF \
+            -DDOBBY_BUILD_TEST=OFF
+          cmake --build build/dobby --config Release --target dobby_static --parallel
+          test -s build/dobby/libdobby.a
+          file build/dobby/libdobby.a
+
       - name: Build LuaLoader.dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
             -dynamiclib -std=c++17 -fobjc-arc -O2 \
             -install_name @executable_path/Frameworks/LuaLoader.dylib \
-            -Ibuild/lua -Ibuild/imgui -Ibuild/imgui/backends \
-            src/loader.mm build/obj/lua/*.o build/obj/imgui/*.o \
+            -Ibuild/lua -Ibuild/imgui -Ibuild/imgui/backends -Ibuild/dobby-src/include \
+            src/loader.mm build/obj/lua/*.o build/obj/imgui/*.o build/dobby/libdobby.a \
             -framework Foundation \
             -framework UIKit \
             -framework CoreGraphics \

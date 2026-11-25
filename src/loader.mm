@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <dlfcn.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
 
@@ -12,6 +13,7 @@
 #include <map>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <algorithm>
@@ -30,6 +32,7 @@ extern "C" {
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_metal.h"
+#include "dobby.h"
 
 // ============================================================================
 // 1. ENCODING HELPERS (CP1251 <-> UTF-8)
@@ -196,6 +199,10 @@ static CGFloat g_OverlayDisplayHeight = 0;
 static CGFloat g_OverlayScale = 1;
 static bool g_ImGuiInitialized = false;
 static uint64_t g_ImGuiFrameCount = 0;
+static std::atomic<bool> g_ArizonaChatInputHookInstalled{false};
+using ArizonaInputEndFn = void (*)(NSString*);
+static ArizonaInputEndFn g_OriginalArizonaInputEnd = nullptr;
+static std::mutex g_ArizonaChatHookMutex;
 
 static void* BoundedLuaAllocator(void* userData, void* pointer, size_t oldSize, size_t newSize) {
     LuaAllocatorState* state = static_cast<LuaAllocatorState*>(userData);
@@ -594,7 +601,7 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
     std::string key = ToLowerASCII(cmdName);
     if (key.empty()) return false;
 
-    // Built-in local aliases; this dispatcher is not connected to Arizona chat.
+    // Built-in Loader aliases are consumed by the local input hook.
     if (key == "loader" || key == "42" || key == "42loader" || key == "luasettings") {
         ToggleLoaderMenu();
         LogConsole(std::string("[Command:") + sourceTag + "] Loader menu toggled with /" + key);
@@ -607,8 +614,6 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
         return false;
     }
 
-    LogConsole(std::string("[Command:") + sourceTag + "] Ran /" + key + " (" + cmdArgs + ")");
-
     RegisteredCommand reg = it->second;
     if (g_LuaOwnerThread != std::this_thread::get_id()) {
         if (g_PendingCommands.size() >= 128) {
@@ -620,6 +625,7 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
         return true;
     }
 
+    LogConsole(std::string("[Command:") + sourceTag + "] Ran /" + key + " (" + cmdArgs + ")");
     if (reg.L && reg.funcRef != LUA_NOREF) {
         lua_State* L = reg.L;
         lua_rawgeti(L, LUA_REGISTRYINDEX, reg.funcRef);
@@ -640,6 +646,52 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
         }
     }
     return true;
+}
+
+static void ArizonaInputEndIntercept(NSString* text) {
+    ArizonaInputEndFn original = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ArizonaChatHookMutex);
+        original = g_OriginalArizonaInputEnd;
+    }
+    if (text) {
+        const char* utf8 = text.UTF8String;
+        if (utf8 && TryExecuteChatCommand(utf8, "ArizonaChat")) {
+            // Loader-owned commands are consumed locally. Anything unknown is
+            // passed to the game's original input handler below.
+            return;
+        }
+    }
+    if (original) original(text);
+}
+
+static void InstallArizonaChatInputHook() {
+    if (g_ArizonaChatInputHookInstalled.load()) return;
+    void* target = dlsym(RTLD_DEFAULT, "ui_input_end");
+    if (!target) {
+        LogConsole("[ChatBridge] Arizona ui_input_end export not found; game chat commands unavailable");
+        return;
+    }
+
+    void* original = nullptr;
+    int result = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ArizonaChatHookMutex);
+        if (g_ArizonaChatInputHookInstalled.load()) return;
+        result = DobbyHook(target,
+                           reinterpret_cast<void*>(ArizonaInputEndIntercept),
+                           &original);
+        if (result == 0 && original) {
+            g_OriginalArizonaInputEnd = reinterpret_cast<ArizonaInputEndFn>(original);
+            g_ArizonaChatInputHookInstalled.store(true);
+        }
+    }
+    if (result != 0 || !original) {
+        LogConsole("[ChatBridge] Could not hook Arizona ui_input_end; game chat commands unavailable");
+        return;
+    }
+
+    LogConsole("[ChatBridge] Arizona input hook installed; registered local commands are consumed, unknown input is forwarded");
 }
 
 // ============================================================================
@@ -2222,9 +2274,11 @@ static void RenderLoaderUI() {
 
         } else if (g_SelectedTab == 1) {
             ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted("Registered Lua commands. Run executes callbacks on the Lua owner thread.");
-            ImGui::TextUnformatted("Built-in local command /loader toggles this menu; Arizona game chat is not connected.");
-            ImGui::TextDisabled("Game chat registration/output is unavailable: no verified Arizona chat API was found.");
+            ImGui::TextUnformatted("Registered Lua commands are consumed by Loader. Unknown text continues to Arizona.");
+            ImGui::TextDisabled(g_ArizonaChatInputHookInstalled.load()
+                ? "Arizona chat input hook: active"
+                : "Arizona chat input hook: unavailable; Run executes callbacks locally");
+            ImGui::TextDisabled("Callbacks run on the Lua owner thread.");
             ImGui::PopTextWrapPos();
             ImGui::Separator();
 
@@ -2277,7 +2331,9 @@ static void RenderLoaderUI() {
             ImGui::Text("Registered local commands: %zu", g_ChatCommands.size());
             ImGui::Text("Loader RAM: %.2f MB", GetLoaderRAM_MB());
             ImGui::Text("Script directory: Documents/lua_loader/scripts");
-            ImGui::TextUnformatted("Arizona game chat bridge: NOT SUPPORTED (no matching exported chat symbols in bundled libag-client.dylib)");
+            ImGui::Text("Arizona chat input hook: %s", g_ArizonaChatInputHookInstalled.load() ? "active" : "unavailable");
+            ImGui::TextUnformatted("Registered slash commands are local; unknown input is forwarded to Arizona.");
+            ImGui::TextUnformatted("Local chat output: NOT SUPPORTED (no verified game display API found).");
             ImGui::TextUnformatted("Game memory, server commands, and game-state APIs are unavailable.");
             ImGui::PopTextWrapPos();
         } else if (g_SelectedTab == 4) {
@@ -2499,6 +2555,7 @@ static void LoaderEntry() {
         if (!InstallStandaloneImGuiView(dev)) {
             LogConsole("[WARN] Standalone ImGui overlay unavailable; using game drawable hook");
         }
+        InstallArizonaChatInputHook();
 
         id<MTLCommandQueue> queue = [dev newCommandQueue];
         id<MTLCommandBuffer> buf = [queue commandBuffer];

@@ -1,5 +1,6 @@
 -- Arizona 42Loader diagnostic script.
--- Copy to Documents/lua_loader/scripts and run from the Loader UI.
+-- Copy to Documents/lua_loader/scripts, then run /42test from Arizona chat
+-- or the Loader Commands tab to verify local command dispatch.
 -- HTTP is asynchronous and requires network access on the device.
 
 local testState = {
@@ -117,9 +118,9 @@ function main()
     report("vibration API", type(az.vibrate) == "function")
     local stoppedThreads = terminateAllThreads()
     report("stop active Lua threads", stoppedThreads >= 2, stoppedThreads)
-    print("[42loader_test] Run /42test in the Loader Commands tab; tap the ImGui buttons to check input.")
-    print("[42loader_test] The local command callback PASS appears after running /42test from the Commands tab or test window.")
+    print("[42loader_test] Run /42test in Arizona chat or the Loader Commands tab; tap the ImGui buttons to check input.")
+    print("[42loader_test] The local command callback PASS appears after /42test is consumed by Loader.")
     print("[42loader_test] NOT SUPPORTED: stopping/unloading this script from Lua; disable it in the Loader Scripts tab.")
     print("[42loader_test] NOT SUPPORTED: mimgui before-frame callback cannot run before NewFrame because the Metal renderer owns frame creation.")
-    print("[42loader_test] NOT SUPPORTED: Arizona game-chat command registration/output; no verified chat bridge is bundled.")
+    print("[42loader_test] NOT SUPPORTED: local text output in Arizona chat; no verified display API is bundled.")
 end
