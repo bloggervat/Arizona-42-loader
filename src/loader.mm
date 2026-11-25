@@ -2,6 +2,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <dlfcn.h>
 
 #include <string>
@@ -21,13 +24,33 @@ extern "C" {
 }
 
 // ============================================================================
-// 1. NATIVE SAMP SYMBOL TYPES
+// 1. NATIVE GTA SA / SAMP SYMBOL TYPES & RESOLVED POINTERS
 // ============================================================================
 
 typedef void (*Fn_AddChatMessage)(void* thisPtr, uint32_t color, const char* text);
 typedef void (*Fn_AddDebugMessage)(void* thisPtr, const char* fmt, ...);
 typedef void (*Fn_SendCommand)(void* thisPtr, const char* cmd);
 typedef void (*Fn_SendChat)(void* thisPtr, const char* msg);
+typedef void (*Fn_SetGameClock)(uint8_t hours, uint8_t minutes, uint8_t days);
+typedef void (*Fn_ForceWeatherNow)(int16_t weather);
+
+static void** g_ppChatWindow = nullptr;
+static Fn_AddChatMessage g_fnAddChatMessage = nullptr;
+static Fn_AddChatMessage g_fnAddClientMessage = nullptr;
+static Fn_AddDebugMessage g_fnAddDebugMessage = nullptr;
+
+static void** g_ppNetGame = nullptr;
+static Fn_SendCommand g_fnSendCommand = nullptr;
+static Fn_SendChat g_fnSendChat = nullptr;
+
+static Fn_SetGameClock g_fnSetGameClock = nullptr;
+static uint8_t* g_pGameClockHours = nullptr;
+static uint8_t* g_pGameClockMinutes = nullptr;
+static uint16_t* g_pGameClockSeconds = nullptr;
+
+static Fn_ForceWeatherNow g_fnForceWeatherNow = nullptr;
+static int16_t* g_pOldWeatherType = nullptr;
+static int16_t* g_pNewWeatherType = nullptr;
 
 // ============================================================================
 // 2. ENCODING HELPERS (CP1251 <-> UTF-8)
@@ -122,6 +145,7 @@ struct ChatHistoryEntry {
     std::string prefix;
     uint32_t color = 0xFFFFFFFF;
     uint32_t pcolor = 0xFFFFFFFF;
+    uint64_t timestampMs = 0;
 };
 
 struct LuaScriptInstance {
@@ -151,15 +175,19 @@ static std::string g_CurrentDialogTitle;
 static std::string g_CurrentDialogText;
 static std::string g_ChatInputText;
 static bool g_IsChatInputActive = false;
+
+static bool g_TimeOverrideActive = false;
 static int g_WorldHour = 12;
 static int g_WorldMinute = 0;
+
+static bool g_WeatherOverrideActive = false;
 static int g_WorldWeather = 1;
 
 static std::string g_LastInterceptedCmd;
 static uint64_t g_LastInterceptedMs = 0;
 static __weak UIView* g_ActiveInputView = nil;
 
-// Native UIKit views (Menu & Floating Button only)
+// Native UIKit views (Menu, Floating Button & SA-MP HUD Chat Overlay)
 static UIButton* g_FloatingMenuButton = nil;
 static UIView* g_MenuOverlayView = nil;
 static UILabel* g_MenuRamLabel = nil;
@@ -168,6 +196,7 @@ static UIScrollView* g_MenuScrollView = nil;
 static UITextField* g_MenuCmdField = nil;
 static UIView* g_MenuCmdBar = nil;
 static UIButton* g_MenuActionBtn = nil;
+static UIView* g_HudChatOverlay = nil;
 static CADisplayLink* g_DisplayLink = nil;
 static uint64_t g_LastUiRefreshMs = 0;
 
@@ -263,43 +292,297 @@ static void LoadSingleScript(LuaScriptInstance* inst);
 static void UnloadSingleScript(LuaScriptInstance* inst);
 static void RefreshMenuContent();
 static void ToggleLoaderMenu();
+static void RefreshHudChatOverlay();
 
 // ============================================================================
-// 4. DIRECT IN-GAME SA-MP CHAT OUTPUT & STARTUP BANNER
+// 4. MACH-O LC_SYMTAB SYMBOL RESOLVER (FINDS NON-EXPORTED C++ SYMBOLS)
 // ============================================================================
+
+static void ScanMachOSymbols() {
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t imgIdx = 0; imgIdx < imageCount; imgIdx++) {
+        const char* imgName = _dyld_get_image_name(imgIdx);
+        if (!imgName) continue;
+        // Scan main executable (index 0) and any non-system app frameworks
+        if (imgIdx > 0 && strstr(imgName, "/System/") != nullptr) continue;
+        if (imgIdx > 0 && strstr(imgName, "/usr/lib/") != nullptr) continue;
+
+        const struct mach_header_64* header = reinterpret_cast<const struct mach_header_64*>(_dyld_get_image_header(imgIdx));
+        if (!header || header->magic != MH_MAGIC_64) continue;
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(imgIdx);
+        const struct segment_command_64* linkeditSeg = nullptr;
+        const struct symtab_command* symtabCmd = nullptr;
+
+        const uint8_t* cmdPtr = reinterpret_cast<const uint8_t*>(header + 1);
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            const struct load_command* lc = reinterpret_cast<const struct load_command*>(cmdPtr);
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64* seg = reinterpret_cast<const struct segment_command_64*>(cmdPtr);
+                if (strcmp(seg->segname, SEG_LINKEDIT) == 0) {
+                    linkeditSeg = seg;
+                }
+            } else if (lc->cmd == LC_SYMTAB) {
+                symtabCmd = reinterpret_cast<const struct symtab_command*>(cmdPtr);
+            }
+            cmdPtr += lc->cmdsize;
+        }
+
+        if (!linkeditSeg || !symtabCmd || symtabCmd->nsyms == 0) continue;
+
+        uintptr_t linkeditBase = static_cast<uintptr_t>(slide) + linkeditSeg->vmaddr - linkeditSeg->fileoff;
+        const struct nlist_64* symtab = reinterpret_cast<const struct nlist_64*>(linkeditBase + symtabCmd->symoff);
+        const char* strtab = reinterpret_cast<const char*>(linkeditBase + symtabCmd->stroff);
+
+        for (uint32_t s = 0; s < symtabCmd->nsyms; s++) {
+            const struct nlist_64& sym = symtab[s];
+            if ((sym.n_type & N_STAB) != 0) continue;
+            if ((sym.n_type & N_TYPE) != N_SECT || sym.n_value == 0) continue;
+            if (sym.n_un.n_strx == 0 || sym.n_un.n_strx >= symtabCmd->strsize) continue;
+
+            const char* name = strtab + sym.n_un.n_strx;
+            void* addr = reinterpret_cast<void*>(static_cast<uintptr_t>(sym.n_value) + slide);
+
+            // Chat Window / Chat Instance
+            if (!g_ppChatWindow && (strcmp(name, "_pChatWindow") == 0 || strcmp(name, "_g_pChatWindow") == 0 ||
+                strcmp(name, "_pChat") == 0 || strcmp(name, "_g_pChat") == 0 ||
+                strstr(name, "CChatWindow11m_pInstance") != nullptr || strstr(name, "CChat11m_pInstance") != nullptr)) {
+                g_ppChatWindow = reinterpret_cast<void**>(addr);
+            }
+            if (!g_fnAddChatMessage && (strstr(name, "CChatWindow14AddChatMessage") != nullptr ||
+                                        strstr(name, "CChat14AddChatMessage") != nullptr ||
+                                        strstr(name, "CChat10AddMessage") != nullptr)) {
+                g_fnAddChatMessage = reinterpret_cast<Fn_AddChatMessage>(addr);
+            }
+            if (!g_fnAddClientMessage && (strstr(name, "CChatWindow16AddClientMessage") != nullptr ||
+                                          strstr(name, "CChat16AddClientMessage") != nullptr)) {
+                g_fnAddClientMessage = reinterpret_cast<Fn_AddChatMessage>(addr);
+            }
+            if (!g_fnAddDebugMessage && (strstr(name, "CChatWindow15AddDebugMessage") != nullptr ||
+                                         strstr(name, "CChat15AddDebugMessage") != nullptr)) {
+                g_fnAddDebugMessage = reinterpret_cast<Fn_AddDebugMessage>(addr);
+            }
+
+            // NetGame
+            if (!g_ppNetGame && (strcmp(name, "_pNetGame") == 0 || strcmp(name, "_g_pNetGame") == 0)) {
+                g_ppNetGame = reinterpret_cast<void**>(addr);
+            }
+            if (!g_fnSendCommand && strstr(name, "CNetGame11SendCommand") != nullptr) {
+                g_fnSendCommand = reinterpret_cast<Fn_SendCommand>(addr);
+            }
+            if (!g_fnSendChat && strstr(name, "CNetGame8SendChat") != nullptr) {
+                g_fnSendChat = reinterpret_cast<Fn_SendChat>(addr);
+            }
+
+            // CClock (World Time)
+            if (!g_fnSetGameClock && strstr(name, "CClock12SetGameClock") != nullptr) {
+                g_fnSetGameClock = reinterpret_cast<Fn_SetGameClock>(addr);
+            }
+            if (!g_pGameClockHours && strstr(name, "CClock19ms_nGameClockHours") != nullptr) {
+                g_pGameClockHours = reinterpret_cast<uint8_t*>(addr);
+            }
+            if (!g_pGameClockMinutes && strstr(name, "CClock21ms_nGameClockMinutes") != nullptr) {
+                g_pGameClockMinutes = reinterpret_cast<uint8_t*>(addr);
+            }
+            if (!g_pGameClockSeconds && strstr(name, "CClock21ms_nGameClockSeconds") != nullptr) {
+                g_pGameClockSeconds = reinterpret_cast<uint16_t*>(addr);
+            }
+
+            // CWeather (World Weather)
+            if (!g_fnForceWeatherNow && strstr(name, "CWeather15ForceWeatherNow") != nullptr) {
+                g_fnForceWeatherNow = reinterpret_cast<Fn_ForceWeatherNow>(addr);
+            }
+            if (!g_pOldWeatherType && strstr(name, "CWeather14OldWeatherType") != nullptr) {
+                g_pOldWeatherType = reinterpret_cast<int16_t*>(addr);
+            }
+            if (!g_pNewWeatherType && strstr(name, "CWeather14NewWeatherType") != nullptr) {
+                g_pNewWeatherType = reinterpret_cast<int16_t*>(addr);
+            }
+        }
+    }
+
+    // Fallback to dlsym if any symbol is dynamically exported
+    if (!g_ppChatWindow) g_ppChatWindow = reinterpret_cast<void**>(dlsym(RTLD_DEFAULT, "pChatWindow"));
+    if (!g_fnAddChatMessage) g_fnAddChatMessage = reinterpret_cast<Fn_AddChatMessage>(dlsym(RTLD_DEFAULT, "_ZN11CChatWindow14AddChatMessageEjPKc"));
+    if (!g_fnAddClientMessage) g_fnAddClientMessage = reinterpret_cast<Fn_AddChatMessage>(dlsym(RTLD_DEFAULT, "_ZN11CChatWindow16AddClientMessageEjPKc"));
+    if (!g_fnSetGameClock) g_fnSetGameClock = reinterpret_cast<Fn_SetGameClock>(dlsym(RTLD_DEFAULT, "_ZN6CClock12SetGameClockEhhh"));
+    if (!g_pGameClockHours) g_pGameClockHours = reinterpret_cast<uint8_t*>(dlsym(RTLD_DEFAULT, "_ZN6CClock19ms_nGameClockHoursE"));
+    if (!g_pGameClockMinutes) g_pGameClockMinutes = reinterpret_cast<uint8_t*>(dlsym(RTLD_DEFAULT, "_ZN6CClock21ms_nGameClockMinutesE"));
+    if (!g_fnForceWeatherNow) g_fnForceWeatherNow = reinterpret_cast<Fn_ForceWeatherNow>(dlsym(RTLD_DEFAULT, "_ZN8CWeather15ForceWeatherNowEs"));
+
+    bool hasNativeChat = (g_ppChatWindow != nullptr) && (g_fnAddChatMessage != nullptr || g_fnAddClientMessage != nullptr || g_fnAddDebugMessage != nullptr);
+    bool hasNativeClock = (g_fnSetGameClock != nullptr) || (g_pGameClockHours != nullptr && g_pGameClockMinutes != nullptr);
+
+    LogConsole(std::string("[SymScan] CChatWindow: ") + (hasNativeChat ? "НАЙДЕН" : "НЕ НАЙДЕН (вкл. SA-MP HUD чат)"));
+    LogConsole(std::string("[SymScan] CClock (время): ") + (hasNativeClock ? "НАЙДЕН" : "НЕ НАЙДЕН (символы вырезаны)"));
+}
+
+static void ApplyWorldOverridesToEngine() {
+    if (g_TimeOverrideActive) {
+        uint8_t h = static_cast<uint8_t>(g_WorldHour % 24);
+        uint8_t m = static_cast<uint8_t>(g_WorldMinute % 60);
+        if (g_pGameClockHours && g_pGameClockMinutes) {
+            *g_pGameClockHours = h;
+            *g_pGameClockMinutes = m;
+            if (g_pGameClockSeconds) *g_pGameClockSeconds = 0;
+        } else if (g_fnSetGameClock) {
+            g_fnSetGameClock(h, m, 1);
+        }
+    }
+    if (g_WeatherOverrideActive) {
+        int16_t w = static_cast<int16_t>(g_WorldWeather);
+        if (g_pOldWeatherType && g_pNewWeatherType) {
+            *g_pOldWeatherType = w;
+            *g_pNewWeatherType = w;
+        } else if (g_fnForceWeatherNow) {
+            g_fnForceWeatherNow(w);
+        }
+    }
+}
+
+// ============================================================================
+// 5. IN-GAME CHAT OUTPUT (NATIVE CChatWindow + SA-MP HUD OVERLAY FALLBACK)
+// ============================================================================
+
+static NSAttributedString* ParseSampColoredString(const std::string& utf8Text, uint32_t baseColor) {
+    NSString* nsStr = [NSString stringWithUTF8String:utf8Text.c_str()];
+    if (!nsStr) nsStr = @"";
+
+    CGFloat r = ((baseColor >> 16) & 0xFF) / 255.0;
+    CGFloat g = ((baseColor >> 8) & 0xFF) / 255.0;
+    CGFloat b = (baseColor & 0xFF) / 255.0;
+    if (r == 0 && g == 0 && b == 0) { r = 1.0; g = 1.0; b = 1.0; }
+    UIColor* currentColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+
+    NSShadow* shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.95];
+    shadow.shadowOffset = CGSizeMake(1.0, 1.0);
+    shadow.shadowBlurRadius = 1.0;
+
+    UIFont* font = [UIFont boldSystemFontOfSize:13.0];
+    NSMutableAttributedString* result = [[NSMutableAttributedString alloc] init];
+
+    NSUInteger len = nsStr.length;
+    NSUInteger idx = 0;
+    NSUInteger chunkStart = 0;
+
+    while (idx < len) {
+        if ([nsStr characterAtIndex:idx] == '{' && idx + 7 < len && [nsStr characterAtIndex:idx + 7] == '}') {
+            NSString* hexPart = [nsStr substringWithRange:NSMakeRange(idx + 1, 6)];
+            unsigned int hexVal = 0;
+            NSScanner* scanner = [NSScanner scannerWithString:hexPart];
+            if ([scanner scanHexInt:&hexVal] && scanner.atEnd) {
+                if (idx > chunkStart) {
+                    NSString* seg = [nsStr substringWithRange:NSMakeRange(chunkStart, idx - chunkStart)];
+                    [result appendAttributedString:[[NSAttributedString alloc] initWithString:seg attributes:@{
+                        NSForegroundColorAttributeName: currentColor,
+                        NSFontAttributeName: font,
+                        NSShadowAttributeName: shadow
+                    }]];
+                }
+                currentColor = [UIColor colorWithRed:((hexVal >> 16) & 0xFF) / 255.0
+                                               green:((hexVal >> 8) & 0xFF) / 255.0
+                                                blue:(hexVal & 0xFF) / 255.0
+                                               alpha:1.0];
+                idx += 8;
+                chunkStart = idx;
+                continue;
+            }
+        }
+        idx++;
+    }
+
+    if (chunkStart < len) {
+        NSString* seg = [nsStr substringFromIndex:chunkStart];
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:seg attributes:@{
+            NSForegroundColorAttributeName: currentColor,
+            NSFontAttributeName: font,
+            NSShadowAttributeName: shadow
+        }]];
+    }
+
+    return result;
+}
+
+static void RefreshHudChatOverlay() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = GetActiveKeyWindow();
+        if (!win) return;
+
+        if (!g_HudChatOverlay) {
+            UIView* v = [[UIView alloc] initWithFrame:CGRectMake(14.0, 106.0, MIN(win.bounds.size.width - 28.0, 480.0), 150.0)];
+            v.tag = 424299;
+            v.backgroundColor = [UIColor clearColor];
+            v.userInteractionEnabled = NO;
+            g_HudChatOverlay = v;
+        }
+        if (g_HudChatOverlay.superview != win) {
+            [win addSubview:g_HudChatOverlay];
+        }
+        [win bringSubviewToFront:g_HudChatOverlay];
+        if (g_FloatingMenuButton) [win bringSubviewToFront:g_FloatingMenuButton];
+        if (g_MenuOverlayView && !g_MenuOverlayView.hidden) [win bringSubviewToFront:g_MenuOverlayView];
+
+        for (UIView* sub in g_HudChatOverlay.subviews) {
+            [sub removeFromSuperview];
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        uint64_t now = NowMs();
+
+        // Collect recent messages from the last 10 seconds (up to 7 lines)
+        std::vector<ChatHistoryEntry> recent;
+        for (int i = static_cast<int>(g_ChatHistory.size()) - 1; i >= 0 && recent.size() < 7; i--) {
+            if (now - g_ChatHistory[i].timestampMs <= 10000) {
+                recent.push_back(g_ChatHistory[i]);
+            }
+        }
+        std::reverse(recent.begin(), recent.end());
+
+        CGFloat y = 0.0;
+        CGFloat maxW = g_HudChatOverlay.bounds.size.width;
+        for (const auto& entry : recent) {
+            UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, y, maxW, 20.0)];
+            lbl.numberOfLines = 2;
+            lbl.attributedText = ParseSampColoredString(entry.text, entry.color);
+            uint64_t age = now - entry.timestampMs;
+            lbl.alpha = (age > 8000) ? MAX(0.0, 1.0 - (age - 8000) / 2000.0) : 1.0;
+            [lbl sizeToFit];
+            [g_HudChatOverlay addSubview:lbl];
+            y += lbl.bounds.size.height + 2.0;
+        }
+    });
+}
 
 static void WriteToInGameChat(const std::string& utf8Text, uint32_t color) {
-    std::string cpText = Utf8ToCp1251(utf8Text);
     if ((color & 0xFF000000) == 0) {
         color |= 0xFF000000;
     }
 
-    void* chatWindowPtr = nullptr;
-    void** ppChat = reinterpret_cast<void**>(dlsym(RTLD_DEFAULT, "pChatWindow"));
-    if (!ppChat) {
-        ppChat = reinterpret_cast<void**>(dlsym(RTLD_DEFAULT, "_pChatWindow"));
-    }
-    if (ppChat && *ppChat) {
-        chatWindowPtr = *ppChat;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+        g_ChatHistory.push_back({utf8Text, "", color, color, NowMs()});
+        if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
     }
 
+    bool wroteNative = false;
+    void* chatWindowPtr = (g_ppChatWindow && *g_ppChatWindow) ? *g_ppChatWindow : nullptr;
     if (chatWindowPtr) {
-        auto fnAddChat = reinterpret_cast<Fn_AddChatMessage>(dlsym(RTLD_DEFAULT, "_ZN11CChatWindow14AddChatMessageEjPKc"));
-        auto fnAddClient = reinterpret_cast<Fn_AddChatMessage>(dlsym(RTLD_DEFAULT, "_ZN11CChatWindow16AddClientMessageEjPKc"));
-        auto fnAddDebug = reinterpret_cast<Fn_AddDebugMessage>(dlsym(RTLD_DEFAULT, "_ZN11CChatWindow15AddDebugMessageEPKcz"));
+        std::string cpText = Utf8ToCp1251(utf8Text);
+        if (g_fnAddChatMessage) {
+            g_fnAddChatMessage(chatWindowPtr, color, cpText.c_str());
+            wroteNative = true;
+        } else if (g_fnAddClientMessage) {
+            g_fnAddClientMessage(chatWindowPtr, color, cpText.c_str());
+            wroteNative = true;
+        } else if (g_fnAddDebugMessage) {
+            g_fnAddDebugMessage(chatWindowPtr, "%s", cpText.c_str());
+            wroteNative = true;
+        }
+    }
 
-        if (fnAddChat) {
-            fnAddChat(chatWindowPtr, color, cpText.c_str());
-            return;
-        }
-        if (fnAddClient) {
-            fnAddClient(chatWindowPtr, color, cpText.c_str());
-            return;
-        }
-        if (fnAddDebug) {
-            fnAddDebug(chatWindowPtr, "%s", cpText.c_str());
-            return;
-        }
+    if (!wroteNative) {
+        RefreshHudChatOverlay();
     }
 }
 
@@ -307,26 +590,14 @@ static void SendToInGameServer(const std::string& utf8Text) {
     std::string cpText = Utf8ToCp1251(utf8Text);
     if (cpText.empty()) return;
 
-    void* netGamePtr = nullptr;
-    void** ppNet = reinterpret_cast<void**>(dlsym(RTLD_DEFAULT, "pNetGame"));
-    if (!ppNet) {
-        ppNet = reinterpret_cast<void**>(dlsym(RTLD_DEFAULT, "_pNetGame"));
-    }
-    if (ppNet && *ppNet) {
-        netGamePtr = *ppNet;
-    }
-
+    void* netGamePtr = (g_ppNetGame && *g_ppNetGame) ? *g_ppNetGame : nullptr;
     if (netGamePtr) {
-        if (cpText[0] == '/') {
-            auto fnSendCmd = reinterpret_cast<Fn_SendCommand>(dlsym(RTLD_DEFAULT, "_ZN4CNetGame11SendCommandEPKc"));
-            if (fnSendCmd) {
-                fnSendCmd(netGamePtr, cpText.c_str());
-                return;
-            }
+        if (cpText[0] == '/' && g_fnSendCommand) {
+            g_fnSendCommand(netGamePtr, cpText.c_str());
+            return;
         }
-        auto fnSendChat = reinterpret_cast<Fn_SendChat>(dlsym(RTLD_DEFAULT, "_ZN4CNetGame8SendChatEPKc"));
-        if (fnSendChat) {
-            fnSendChat(netGamePtr, cpText.c_str());
+        if (g_fnSendChat) {
+            g_fnSendChat(netGamePtr, cpText.c_str());
             return;
         }
     }
@@ -390,7 +661,7 @@ static void ShowStartupBanner(NSString* message, BOOL isError) {
 }
 
 // ============================================================================
-// 5. CHAT COMMAND EXECUTION ENGINE
+// 6. CHAT COMMAND EXECUTION ENGINE
 // ============================================================================
 
 static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourceTag = "unknown") {
@@ -465,7 +736,7 @@ static bool TryExecuteChatCommand(const std::string& rawInput, const char* sourc
 }
 
 // ============================================================================
-// 6. NATIVE UIKIT MENU & FLOATING BUTTON "42"
+// 7. NATIVE UIKIT MENU & FLOATING BUTTON "42"
 // ============================================================================
 
 @interface LoaderUIHandler : NSObject <UITextFieldDelegate>
@@ -714,9 +985,9 @@ static void RefreshMenuContent() {
                 logLbl.text = nsLine;
                 logLbl.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
                 logLbl.numberOfLines = 0;
-                if (line.find("ERROR") != std::string::npos) {
+                if (line.find("ERROR") != std::string::npos || line.find("НЕ НАЙДЕН") != std::string::npos) {
                     logLbl.textColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
-                } else if (line.find("HookDiag") != std::string::npos || line.find("[OK]") != std::string::npos) {
+                } else if (line.find("HookDiag") != std::string::npos || line.find("[OK]") != std::string::npos || line.find("НАЙДЕН") != std::string::npos) {
                     logLbl.textColor = [UIColor colorWithRed:0.45 green:0.95 blue:0.60 alpha:1.0];
                 } else {
                     logLbl.textColor = [UIColor colorWithWhite:0.90 alpha:1.0];
@@ -729,10 +1000,17 @@ static void RefreshMenuContent() {
         } else if (g_SelectedTab == 3) {
             g_MenuCmdBar.hidden = YES;
 
-            UILabel* setLbl = [[UILabel alloc] initWithFrame:CGRectMake(12.0, y, w - 24.0, 120.0)];
+            bool hasNativeChat = (g_ppChatWindow != nullptr) && (g_fnAddChatMessage != nullptr || g_fnAddClientMessage != nullptr);
+            bool hasNativeClock = (g_fnSetGameClock != nullptr) || (g_pGameClockHours != nullptr && g_pGameClockMinutes != nullptr);
+
+            UILabel* setLbl = [[UILabel alloc] initWithFrame:CGRectMake(12.0, y, w - 24.0, 150.0)];
             setLbl.text = [NSString stringWithFormat:
-                @"Время мира: %02d:%02d\nПогода ID: %d\nЗагружено скриптов: %zu\nЗарегистрировано команд: %zu\nДиректория: Documents/lua_loader",
-                g_WorldHour, g_WorldMinute, g_WorldWeather, g_Scripts.size(), g_ChatCommands.size()];
+                @"Время мира: %02d:%02d (%s)\nПогода ID: %d\nНативный чат: %s\nНативные часы (CClock): %s\nСкриптов: %zu | Команд: %zu",
+                g_WorldHour, g_WorldMinute, g_TimeOverrideActive ? "фикс" : "авто",
+                g_WorldWeather,
+                hasNativeChat ? "Да" : "HUD оверлей",
+                hasNativeClock ? "Найдены" : "Вырезаны (stripped)",
+                g_Scripts.size(), g_ChatCommands.size()];
             setLbl.textColor = [UIColor whiteColor];
             setLbl.font = [UIFont systemFontOfSize:13.0];
             setLbl.numberOfLines = 0;
@@ -797,7 +1075,7 @@ static void EnsureFloatingMenuButton() {
 }
 
 // ============================================================================
-// 7. SUBMIT-ONLY CHAT INPUT INTERCEPTION (NO MID-TYPING FIRING)
+// 8. SUBMIT-ONLY CHAT INPUT INTERCEPTION
 // ============================================================================
 
 typedef void (*Fn_SetDelegate)(id, SEL, id);
@@ -851,7 +1129,6 @@ static BOOL swizzled_textFieldShouldReturn(id self, SEL _cmd, UITextField* textF
 }
 
 static BOOL swizzled_tfShouldChangeChars(id self, SEL _cmd, UITextField* textField, NSRange range, NSString* string) {
-    // Only trigger when Return/Newline is explicitly entered
     if (string && ([string rangeOfString:@"\n"].location != NSNotFound || [string rangeOfString:@"\r"].location != NSNotFound)) {
         if (textField && textField != g_MenuCmdField && textField.text.length > 0) {
             std::string txt([textField.text UTF8String]);
@@ -954,7 +1231,6 @@ static BOOL swizzled_becomeFirstResponder(id self, SEL _cmd) {
 }
 
 static BOOL swizzled_sendAction(id self, SEL _cmd, SEL action, id target, id sender, UIEvent* event) {
-    // 1. If sender is UITextField, ONLY intercept DidEndOnExit (Return key), NEVER EditingChanged!
     if ([sender isKindOfClass:[UITextField class]]) {
         UITextField* tf = (UITextField*)sender;
         if (tf != g_MenuCmdField && tf.text.length > 0 && action && target) {
@@ -971,7 +1247,6 @@ static BOOL swizzled_sendAction(id self, SEL _cmd, SEL action, id target, id sen
         return orig_SendAction ? orig_SendAction(self, _cmd, action, target, sender, event) : NO;
     }
 
-    // 2. If user taps an on-screen "Send / Отправить" UIButton while chat input is focused
     if ([sender isKindOfClass:[UIButton class]] && sender != g_MenuActionBtn && sender != g_FloatingMenuButton) {
         UIView* active = g_ActiveInputView;
         if (active && active != g_MenuCmdField && active.isFirstResponder && [active respondsToSelector:@selector(text)]) {
@@ -1087,7 +1362,7 @@ static void InstallSafeUIKitChatHooks() {
 }
 
 // ============================================================================
-// 8. LUA 5.4 C++ API FUNCTIONS (MOONLOADER + AZ + SAMP)
+// 9. LUA 5.4 C++ API FUNCTIONS (MOONLOADER + AZ + SAMP)
 // ============================================================================
 
 static int l_print(lua_State* L) {
@@ -1197,12 +1472,6 @@ static int l_sampAddChatMessage(lua_State* L) {
     uint32_t color = static_cast<uint32_t>(luaL_optinteger(L, 2, 0xFF9B59B6));
     std::string utf8 = Cp1251ToUtf8(text);
 
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
-        g_ChatHistory.push_back({utf8, "", color, color});
-        if (g_ChatHistory.size() > 100) g_ChatHistory.erase(g_ChatHistory.begin());
-    }
-
     LogConsole("[Chat] " + utf8);
     WriteToInGameChat(utf8, color);
     return 0;
@@ -1294,13 +1563,44 @@ static int l_sampGetChatString(lua_State* L) {
 }
 
 static int l_setTimeOfDay(lua_State* L) {
-    g_WorldHour = static_cast<int>(luaL_checkinteger(L, 1)) % 24;
-    g_WorldMinute = static_cast<int>(luaL_optinteger(L, 2, 0)) % 60;
+    int h = static_cast<int>(luaL_checkinteger(L, 1));
+    int m = static_cast<int>(luaL_optinteger(L, 2, 0));
+    if (h < 0) {
+        g_TimeOverrideActive = false;
+        LogConsole("[World] Фиксация времени отключена");
+        return 0;
+    }
+    g_WorldHour = h % 24;
+    g_WorldMinute = (m < 0 ? 0 : m) % 60;
+    g_TimeOverrideActive = true;
+    ApplyWorldOverridesToEngine();
     LogConsole("[World] Установлено время: " + std::to_string(g_WorldHour) + ":" + (g_WorldMinute < 10 ? "0" : "") + std::to_string(g_WorldMinute));
     return 0;
 }
-static int l_getTimeOfDay(lua_State* L) { lua_pushinteger(L, g_WorldHour); lua_pushinteger(L, g_WorldMinute); return 2; }
-static int l_forceWeatherNow(lua_State* L) { g_WorldWeather = static_cast<int>(luaL_checkinteger(L, 1)); return 0; }
+
+static int l_getTimeOfDay(lua_State* L) {
+    if (g_pGameClockHours && g_pGameClockMinutes) {
+        lua_pushinteger(L, *g_pGameClockHours);
+        lua_pushinteger(L, *g_pGameClockMinutes);
+    } else {
+        lua_pushinteger(L, g_WorldHour);
+        lua_pushinteger(L, g_WorldMinute);
+    }
+    return 2;
+}
+
+static int l_forceWeatherNow(lua_State* L) {
+    int w = static_cast<int>(luaL_checkinteger(L, 1));
+    if (w < 0) {
+        g_WeatherOverrideActive = false;
+        return 0;
+    }
+    g_WorldWeather = w;
+    g_WeatherOverrideActive = true;
+    ApplyWorldOverridesToEngine();
+    LogConsole("[World] Установлена погода ID: " + std::to_string(g_WorldWeather));
+    return 0;
+}
 
 static int l_getScreenResolution(lua_State* L) {
     CGRect bounds = [[UIScreen mainScreen] nativeBounds];
@@ -1414,7 +1714,7 @@ static int l_imgui_Button(lua_State* L) { lua_pushboolean(L, 0); return 1; }
 static int l_imgui_Noop(lua_State* L) { return 0; }
 
 // ============================================================================
-// 9. MOONLOADER BUILT-IN RUNTIME & LIBRARIES
+// 10. MOONLOADER BUILT-IN RUNTIME & LIBRARIES
 // ============================================================================
 
 static const char* kMoonLoaderBootstrapLua = R"lua(
@@ -1679,7 +1979,7 @@ static void RegisterAllLuaAPI(lua_State* L, const std::string& filename, const s
 }
 
 // ============================================================================
-// 10. SCRIPT LOADING, RELOADING & TICKING
+// 11. SCRIPT LOADING, RELOADING & TICKING
 // ============================================================================
 
 static void UnloadSingleScript(LuaScriptInstance* inst) {
@@ -1789,6 +2089,9 @@ static void TickScripts() {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     uint64_t now = NowMs();
 
+    // Keep overridden world time & weather locked against server sync
+    ApplyWorldOverridesToEngine();
+
     for (auto* s : g_Scripts) {
         if (!s->enabled || !s->L || s->hasError) continue;
 
@@ -1819,7 +2122,7 @@ static void TickScripts() {
 }
 
 // ============================================================================
-// 11. UIKIT HANDLER IMPLEMENTATION & ENTRY POINT
+// 12. UIKIT HANDLER IMPLEMENTATION & ENTRY POINT
 // ============================================================================
 
 @implementation LoaderUIHandler
@@ -1916,6 +2219,9 @@ static void TickScripts() {
     if (now - g_LastUiRefreshMs > 500) {
         g_LastUiRefreshMs = now;
         EnsureFloatingMenuButton();
+        if (g_HudChatOverlay) {
+            RefreshHudChatOverlay();
+        }
         if (g_MenuOpen && g_SelectedTab == 2) {
             RefreshMenuContent();
         }
@@ -1929,6 +2235,7 @@ static void LoaderEntry() {
     EnsureDirectories();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ScanMachOSymbols();
         InstallSafeUIKitChatHooks();
         EnsureFloatingMenuButton();
         ReloadAllScripts();
@@ -1936,6 +2243,6 @@ static void LoaderEntry() {
         g_DisplayLink = [CADisplayLink displayLinkWithTarget:[LoaderUIHandler shared] selector:@selector(onDisplayLink:)];
         [g_DisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
-        LogConsole("Arizona 42Loader готов (Чат-вывод + Кнопка '42' + Отправка команд активны)");
+        LogConsole("Arizona 42Loader готов");
     });
 }
