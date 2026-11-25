@@ -235,6 +235,8 @@ static void AddOverlayNotification(std::string title, std::string message, uint6
     g_Notifications.push_back({std::move(title), std::move(message), NowMs() + lifetimeMs});
 }
 
+static void LogConsole(const std::string& line);
+
 static void QueueLocalCommand(std::string command) {
     std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
     if (g_PendingCommands.size() >= 128) {
