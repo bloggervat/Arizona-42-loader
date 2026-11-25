@@ -76,7 +76,7 @@ jobs:
         run: |
           codesign --force --sign - --timestamp=none LuaLoader.dylib
           codesign --verify --strict LuaLoader.dylib
-          lipo -verify_arch arm64 LuaLoader.dylib
+          lipo LuaLoader.dylib -verify_arch arm64
           codesign -dv --verbose=4 LuaLoader.dylib
           otool -L LuaLoader.dylib
 
