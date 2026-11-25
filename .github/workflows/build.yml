@@ -77,7 +77,6 @@ jobs:
             -DDOBBY_BUILD_SILICON=ON \
             -DDOBBY_GENERATE_SHARED=OFF \
             -DDOBBY_DEBUG=OFF \
-            -DPlugin.SymbolResolver=OFF \
             -DNearBranch=ON \
             -DDOBBY_BUILD_EXAMPLE=OFF \
             -DDOBBY_BUILD_TEST=OFF
