@@ -176,6 +176,8 @@ static std::thread::id g_LuaOwnerThread;
 static bool g_PendingReload = true;
 static bool g_OwnerThreadWarningLogged = false;
 
+static void ShowNativeLoaderMenu();
+
 static UIButton* g_FloatingMenuButton = nullptr;
 static CGFloat g_OverlayDisplayWidth = 0;
 static CGFloat g_OverlayDisplayHeight = 0;
@@ -373,7 +375,9 @@ static void ToggleLoaderMenu() {
 
 @implementation LoaderFloatingBtnHandler
 + (void)onTap:(UIButton*)sender {
+    (void)sender;
     ToggleLoaderMenu();
+    ShowNativeLoaderMenu();
 }
 
 + (void)onPan:(UIPanGestureRecognizer*)pan {
@@ -2216,6 +2220,72 @@ static void ShowCommandPrompt() {
         }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [presenter presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+// Keep a native UIKit entry point available even when the host application's
+// Metal command-buffer implementation does not expose a hookable present method.
+// Lua callbacks are still only queued here and run later on TickScripts' owner thread.
+static void ShowNativeLoaderMenu() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow* win = GetActiveKeyWindow();
+        UIViewController* presenter = win.rootViewController;
+        while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
+            presenter = presenter.presentedViewController;
+        if (!presenter || [presenter isBeingPresented]) return;
+
+        UIAlertController* menu = [UIAlertController alertControllerWithTitle:@"Arizona 42Loader"
+                                                                       message:@"Loader-local commands. Commands run on the Lua scheduler thread."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [menu addAction:[UIAlertAction actionWithTitle:@"Open full ImGui menu"
+                                                style:UIAlertActionStyleDefault
+                                              handler:nil]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"Enter local command…"
+                                                style:UIAlertActionStyleDefault
+                                              handler:^(__unused UIAlertAction* action) {
+            ShowCommandPrompt();
+        }]];
+
+        std::vector<std::pair<std::string, std::string>> commands;
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            commands.reserve(g_ChatCommands.size());
+            for (const auto& item : g_ChatCommands)
+                commands.emplace_back(item.first, item.second.scriptName);
+        }
+        const size_t visibleCommands = std::min<size_t>(commands.size(), 5);
+        for (size_t i = 0; i < visibleCommands; ++i) {
+            NSString* title = [NSString stringWithFormat:@"Run /%s  (%s)",
+                               commands[i].first.c_str(), commands[i].second.c_str()];
+            NSString* command = [NSString stringWithFormat:@"/%s", commands[i].first.c_str()];
+            [menu addAction:[UIAlertAction actionWithTitle:title
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(__unused UIAlertAction* action) {
+                const char* utf8 = command.UTF8String;
+                if (utf8) QueueLocalCommand(std::string(utf8));
+            }]];
+        }
+        if (commands.size() > visibleCommands) {
+            NSString* more = [NSString stringWithFormat:@"%zu more commands in full menu", commands.size() - visibleCommands];
+            [menu addAction:[UIAlertAction actionWithTitle:more style:UIAlertActionStyleDefault handler:nil]];
+        }
+        [menu addAction:[UIAlertAction actionWithTitle:@"Reload Lua scripts"
+                                                style:UIAlertActionStyleDefault
+                                              handler:^(__unused UIAlertAction* action) {
+            std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+            g_PendingReload = true;
+        }]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"Close Loader menu"
+                                                style:UIAlertActionStyleCancel
+                                              handler:^(__unused UIAlertAction* action) {
+            bool isOpen = false;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_EngineMutex);
+                isOpen = g_MenuOpen;
+            }
+            if (isOpen) ToggleLoaderMenu();
+        }]];
+        [presenter presentViewController:menu animated:YES completion:nil];
     });
 }
 
